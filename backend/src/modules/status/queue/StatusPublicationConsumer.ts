@@ -17,9 +17,9 @@ export const DEFAULT_STATUS_PUBLICATION_GRACE_MINUTES = 15;
  *
  * 读路径（getActivePublication / getActiveMetricPublication）只认
  * status_publication_state.active_publication_id，非活跃的发布一行也读不到。
- * 但 status_metric_publications 每次发布都要为每台 agent 落一份 24 小时指标的
- * 完整 JSON（实测约 300 KB/行、每 5 分钟一轮），等每天一次的 cleanup 才删的话，
- * 单台 agent 就能攒出上百 MB——比它要展示的块表数据本身大两个数量级。
+ * 旧版本的 status_metric_publications 每次发布都为每台 agent 保存一份 24 小时
+ * 指标 JSON（实测约 300 KB/行）。历史曲线现在直接读取增量小时块，仍回收
+ * 升级前遗留的整天快照，避免旧数据占据数据库容量。
  *
  * 宽限期不是留给读路径的，是留给并发的 outbox 消费者：另一个消费者可能已经插入
  * 新发布但还没来得及切 active，此时把它当"非活跃"删掉，会让它切过去之后 JOIN 落空。
@@ -118,58 +118,11 @@ export class StatusPublicationConsumer implements OutboxConsumer {
     if (!payloadJson || !etag || !generatedAt) {
       throw new Error("Status publication payload is incomplete");
     }
-    const parsedSnapshot = parsePublicStatusSnapshot(payloadJson);
-    if (!parsedSnapshot) {
+    if (!parsePublicStatusSnapshot(payloadJson)) {
       throw new Error("Stored status publication failed the safe DTO contract");
     }
-    const agentIds = (parsedSnapshot.agents as unknown[]).flatMap((item) => {
-      if (!item || typeof item !== "object" || Array.isArray(item)) return [];
-      const id = Number((item as { id?: unknown }).id);
-      return Number.isSafeInteger(id) && id > 0 ? [id] : [];
-    });
-    const metricDrafts = await new D1StatusRepository(
-      this.env
-    ).buildPublicAgentMetricPublications(agentIds);
-    const metricRows = await Promise.all(
-      metricDrafts.map(async (draft) => {
-        const metricPayload = JSON.stringify({ success: true, agent: draft.metrics });
-        if (!parsePublicStatusSnapshot(JSON.stringify({ monitors: [], agents: draft.metrics }))) {
-          throw new Error("Public metric publication failed the safe DTO contract");
-        }
-        return {
-          agent_id: draft.agentId,
-          payload_json: metricPayload,
-          etag: `"sha256-${await sha256Hex(metricPayload)}"`,
-        };
-      })
-    );
-    await this.env.DB.prepare(
-      `INSERT OR IGNORE INTO status_metric_publications
-       (status_publication_id, agent_id, payload_json, etag, generated_at,
-        created_at, updated_at)
-       SELECT ?,
-              CAST(json_extract(value, '$.agent_id') AS INTEGER),
-              json_extract(value, '$.payload_json'),
-              json_extract(value, '$.etag'), ?, ?, ?
-       FROM json_each(?)`
-    )
-      .bind(
-        publicationId,
-        generatedAt,
-        nowIso,
-        nowIso,
-        JSON.stringify(metricRows)
-      )
-      .run();
-    const metricCount = await this.env.DB.prepare(
-      `SELECT COUNT(*) AS count FROM status_metric_publications
-       WHERE status_publication_id = ?`
-    )
-      .bind(publicationId)
-      .first<{ count: number }>();
-    if (Number(metricCount?.count ?? 0) !== agentIds.length) {
-      throw new Error("Public metric publication set is incomplete");
-    }
+    // History already lives in incrementally projected hourly blocks. Publishing
+    // only changes the small page snapshot; visitors request curve hours on demand.
 
     const publicationState = this.env.DB.prepare(
       `INSERT INTO status_publication_state(singleton_key, active_publication_id, updated_at)

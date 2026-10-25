@@ -343,12 +343,19 @@ export class AgentRoom extends DurableObject {
 
     // 当前广播只发送本次变化。状态变更不重复传输缓存指标；新连接收到合并缓存。
     const outgoing: LatestReport = { update: mergedIncoming, receivedAt };
+    // 本次更新仅含一个 Agent，先筛订阅再按可见范围复用；缓存不跨更新或首屏订阅集合。
+    const serializedByScope = new Map<SubscriberAttachment["scope"], string>();
     let delivered = 0;
     for (const socket of this.ctx.getWebSockets()) {
       const attachment = this.readSubscriberAttachment(socket);
       if (!attachment || !attachment.agentIds.includes(update.agentId)) continue;
       try {
-        socket.send(this.serializeUpdates([outgoing], attachment.scope));
+        let serialized = serializedByScope.get(attachment.scope);
+        if (serialized === undefined) {
+          serialized = this.serializeUpdates([outgoing], attachment.scope);
+          serializedByScope.set(attachment.scope, serialized);
+        }
+        socket.send(serialized);
         delivered += 1;
       } catch {
         // 单个订阅者失败不影响同分片其他连接，运行时会回收异常连接。

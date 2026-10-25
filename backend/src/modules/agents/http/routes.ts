@@ -46,6 +46,9 @@ import { requestStatusRebuild } from "../../status/persistence/status-events";
 import { streamJsonDataArrayResponse } from "../../../platform/http/stream-json";
 import { agentReportSourceFromCf } from "../../../utils/geo";
 import { realtimeRoomName } from "../realtime/RealtimeSharding";
+import { BINARY_REPORT_CONTENT_TYPE, MAX_BINARY_REPORT_BYTES, parseBinaryReport } from "./binary-report";
+import type { AgentReportCommand } from "../domain/models";
+import { createMetricHistoryResponse } from "./history-response";
 
 const agentsV2 = new Hono<{
   Bindings: Bindings;
@@ -419,6 +422,15 @@ agentsV2.get("/live", async (c) => {
   });
 });
 
+agentsV2.get("/:id/metrics/blocks", async (c) => {
+  const parsedId = agentV2IdSchema.safeParse(c.req.param("id"));
+  const parsedQuery = agentV2MetricsQuerySchema.safeParse(c.req.query());
+  if (!parsedId.success) return validationProblem(c, zodErrors(parsedId.error.issues));
+  if (!parsedQuery.success) return validationProblem(c, zodErrors(parsedQuery.error.issues));
+  const result = await createMetricHistoryResponse(c.env, parsedId.data, Number(parsedQuery.data.hours));
+  return result ?? problemResponse(c, { status: 404, code: "AGENT_NOT_FOUND", title: "Agent not found" });
+});
+
 agentsV2.get("/:id/metrics", async (c) => {
   const parsedId = agentV2IdSchema.safeParse(c.req.param("id"));
   const parsedQuery = agentV2MetricsQuerySchema.safeParse(c.req.query());
@@ -601,14 +613,27 @@ agentsV2.post("/reports", async (c) => {
       title: "Agent credential is required",
     });
   }
-  const body = await parseJson(c);
-  if (!body.ok) return validationProblem(c, { body: ["请求体必须是 JSON"] });
-  const parsed = agentV5ReportSchema.safeParse(body.value);
-  if (!parsed.success) return validationProblem(c, zodErrors(parsed.error.issues));
+  let report: AgentReportCommand;
+  if (c.req.header("Content-Type")?.split(";")[0].trim().toLowerCase() === BINARY_REPORT_CONTENT_TYPE) {
+    try {
+      if (!c.req.raw.body || (c.req.header("Content-Encoding") ?? "identity") !== "identity") {
+        throw new Error("Binary reports do not use an outer content encoding");
+      }
+      report = parseBinaryReport(await readBodyWithLimit(c.req.raw.body, MAX_BINARY_REPORT_BYTES));
+    } catch {
+      return validationProblem(c, { body: ["二进制上报格式或大小不正确"] });
+    }
+  } else {
+    const body = await parseJson(c);
+    if (!body.ok) return validationProblem(c, { body: ["请求体必须是 JSON"] });
+    const parsed = agentV5ReportSchema.safeParse(body.value);
+    if (!parsed.success) return validationProblem(c, zodErrors(parsed.error.issues));
+    report = parsed.data;
+  }
   const result = await handle(c, () =>
     createAgentUseCases(c.env).acceptReport(
       token,
-      parsed.data,
+      report,
       agentReportSourceFromCf(c.req.raw.cf)
     )
   );

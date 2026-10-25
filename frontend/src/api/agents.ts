@@ -4,6 +4,7 @@ import {
   unwrapOpenApi,
   v2Client,
 } from "./generated/v2-client";
+import { decodeAgentMetricHistoryInWorker } from "../features/agents/history/workerClient";
 
 export type AgentV2 = components["schemas"]["Agent"];
 export type AgentPage = components["schemas"]["AgentPage"];
@@ -90,6 +91,25 @@ export async function getAgentMetrics(
   signal?: AbortSignal,
   hours: "1" | "6" | "12" | "24" | "168" = "24"
 ): Promise<AgentMetric[]> {
+  try {
+    const blocks = await v2Client.GET("/api/v2/agents/{id}/metrics/blocks", {
+      params: { path: { id }, query: { hours } },
+      parseAs: "arrayBuffer",
+      cache: "no-store",
+      signal,
+    });
+    const buffer = unwrapOpenApi(blocks);
+    if (!(buffer instanceof ArrayBuffer)) {
+      throw new Error("Invalid metric history binary response");
+    }
+    return await decodeAgentMetricHistoryInWorker(buffer, id, signal);
+  } catch (error) {
+    // 取消包括离开页面/切换时间窗口，不应再触发旧接口请求。
+    if (signal?.aborted || (error instanceof Error && error.name === "AbortError")) {
+      throw error;
+    }
+  }
+
   const result = await v2Client.GET("/api/v2/agents/{id}/metrics", {
     params: { path: { id }, query: { hours } },
     signal,

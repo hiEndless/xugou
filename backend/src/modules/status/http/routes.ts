@@ -8,7 +8,7 @@ import {
 import { ApplicationProblem } from "../../../shared/errors/ApplicationProblem";
 import { getEnvNumber } from "../../../utils/env";
 import { createStatusUseCases } from "../composition";
-import { publicAgentIdSchema, statusConfigV2Schema } from "./schemas";
+import { publicAgentIdSchema, publicMetricBucketsSchema, publicMetricHourSchema, statusConfigV2Schema } from "./schemas";
 import { getAllowedOrigin } from "../../../middlewares/cors";
 import {
   parseAgentRoomSubscriptions,
@@ -161,9 +161,59 @@ statusV2.get("/public", async (c) => {
   });
 });
 
+statusV2.get("/public/agents/:agentId/metrics/manifest", async (c) => {
+  const parsed = publicAgentIdSchema.safeParse(c.req.param("agentId"));
+  if (!parsed.success) return validation(c);
+  const result = await handle(c, () =>
+    createStatusUseCases(c.env).getPublicMetricManifest(parsed.data)
+  );
+  if (result instanceof Response) return result;
+  c.header("Cache-Control", "public, max-age=30");
+  return c.json(result);
+});
+
+statusV2.get("/public/agents/:agentId/metrics/hours", async (c) => {
+  const agent = publicAgentIdSchema.safeParse(c.req.param("agentId"));
+  const buckets = publicMetricBucketsSchema.safeParse(c.req.query("buckets"));
+  if (!agent.success || !buckets.success) return validation(c);
+  const result = await handle(c, () =>
+    createStatusUseCases(c.env).getPublicMetricHours(agent.data, buckets.data)
+  );
+  if (result instanceof Response) return result;
+  return new Response(result.payloadJson, { headers: {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "public, max-age=30",
+  } });
+});
+
+statusV2.get("/public/agents/:agentId/metrics/hours/:bucketStart", async (c) => {
+  const agent = publicAgentIdSchema.safeParse(c.req.param("agentId"));
+  const hour = publicMetricHourSchema.safeParse(c.req.param("bucketStart"));
+  if (!agent.success || !hour.success) return validation(c);
+  // Membership is checked before every response, including conditional requests.
+  // Long-lived immutable browser caches must not bypass visibility changes.
+  const result = await handle(c, () =>
+    createStatusUseCases(c.env).getPublicMetricHour(agent.data, hour.data)
+  );
+  if (result instanceof Response) return result;
+  const headers = {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "public, max-age=60",
+    ETag: result.etag,
+  };
+  if (etagMatches(c.req.header("If-None-Match"), result.etag)) {
+    return new Response(null, { status: 304, headers });
+  }
+  return new Response(result.payloadJson, { headers });
+});
+
 statusV2.get("/public/agents/:agentId/metrics", async (c) => {
   const parsed = publicAgentIdSchema.safeParse(c.req.param("agentId"));
   if (!parsed.success) return validation(c);
+  const visible = await handle(c, () =>
+    createStatusUseCases(c.env).getPublicMetricManifest(parsed.data)
+  );
+  if (visible instanceof Response) return visible;
   const cacheControl = `public, max-age=${getEnvNumber(
     c.env,
     "PUBLIC_METRICS_CACHE_TTL_SECONDS",

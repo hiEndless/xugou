@@ -356,6 +356,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v2/agents/{id}/metrics/blocks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["getAgentMetricBlocksV2"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v2/agents/{id}/metrics/latest": {
         parameters: {
             query?: never;
@@ -429,7 +445,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        post: operations["acceptAgentReportV4"];
+        post: operations["acceptAgentReport"];
         delete?: never;
         options?: never;
         head?: never;
@@ -492,6 +508,54 @@ export interface paths {
             cookie?: never;
         };
         get: operations["getPublicAgentMetricsV2"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/status/public/agents/{agentId}/metrics/manifest": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["getPublicAgentMetricManifestV2"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/status/public/agents/{agentId}/metrics/hours": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["getPublicAgentMetricHoursV2"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/status/public/agents/{agentId}/metrics/hours/{bucketStart}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["getPublicAgentMetricHourV2"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1204,9 +1268,18 @@ export interface components {
             ipv4_reachable?: boolean | null;
             ipv6_reachable?: boolean | null;
         };
-        AgentReportV4: {
+        AgentReportBlock: {
+            /** @enum {integer} */
+            resolution: 1 | 60;
+            bucket_start: number;
+            point_count: number;
             /** @constant */
-            protocol_version: 4;
+            codec: 1;
+            data: string;
+        };
+        AgentReportV5: {
+            /** @constant */
+            protocol_version: 5;
             agent_version?: string;
             /** Format: uuid */
             report_id: string;
@@ -1217,7 +1290,46 @@ export interface components {
             boot_time?: number | null;
             keepalive_seconds?: number;
             report_interval_seconds?: number;
-            samples: components["schemas"]["AgentReportSample"][];
+            blocks: components["schemas"]["AgentReportBlock"][];
+            latest?: components["schemas"]["AgentReportSample"];
+        };
+        PublicMinutePoint: {
+            c: number | null;
+            p: number | null;
+            t: number | null;
+            u: number | null;
+            v4: number | null;
+            v6: number | null;
+            m: (number | null)[];
+            l: (number | null)[];
+            s: (number | null)[];
+            d: (string | number | null)[][];
+            n: (string | number | null)[][];
+        };
+        PublicMetricManifest: {
+            /** @constant */
+            success: true;
+            agent_id: number;
+            from: number;
+            to: number;
+            hours: {
+                bucket_start: number;
+                revision: string;
+            }[];
+        };
+        PublicMetricHourResult: {
+            /** @constant */
+            success: true;
+            agent_id: number;
+            bucket_start: number;
+            chunk: {
+                /** @constant */
+                v: 1;
+                r: number;
+                p: {
+                    [key: string]: components["schemas"]["PublicMinutePoint"];
+                };
+            };
         };
         AgentReportAccepted: {
             /** Format: uuid */
@@ -1466,6 +1578,82 @@ export interface components {
             data: components["schemas"]["NotificationHistory"][];
             next_cursor: number | null;
             has_more: boolean;
+        };
+        PublicMetricHourChunk: {
+            /** @constant */
+            v: 1;
+            r: number;
+            p: {
+                [key: string]: components["schemas"]["PublicMinutePoint"];
+            };
+        };
+        PublicMetricHoursResult: {
+            /** @constant */
+            success: true;
+            agent_id: number;
+            hours: {
+                bucket_start: number;
+                chunk: components["schemas"]["PublicMetricHourChunk"];
+            }[];
+            missing: number[];
+        };
+        AgentTrafficInterfaceSummary: {
+            name: string;
+            first_ts: number;
+            last_ts: number;
+            first_rx: number;
+            first_tx: number;
+            last_rx: number;
+            last_tx: number;
+            delta_rx: number;
+            delta_tx: number;
+        };
+        AgentReportSummary: {
+            first_ts: number;
+            last_ts: number;
+            cpu_usage_peak: number | null;
+            memory_usage_peak: number | null;
+            disk_usage_peak: number | null;
+            traffic: {
+                utc_day: string;
+                first_ts: number;
+                last_ts: number;
+                interfaces: components["schemas"]["AgentTrafficInterfaceSummary"][];
+                last_speed: null | {
+                    rx: number | null;
+                    tx: number | null;
+                };
+            }[];
+        };
+        AgentReportV6Metadata: {
+            /** @constant */
+            protocol_version: 6;
+            agent_version?: string;
+            /** Format: uuid */
+            report_id: string;
+            hostname?: string | null;
+            ip_addresses?: string[];
+            os?: string | null;
+            version?: string | null;
+            boot_time?: number | null;
+            keepalive_seconds?: number;
+            report_interval_seconds?: number;
+            blocks: {
+                /** @enum {integer} */
+                resolution: 1 | 60;
+                bucket_start: number;
+                point_count: number;
+                /** @constant */
+                codec: 1;
+                byte_length: number;
+            }[];
+            latest: components["schemas"]["AgentReportSample"];
+            summary: components["schemas"]["AgentReportSummary"];
+            minute_summaries: {
+                bucket_start: number;
+                point_count: number;
+                avg: components["schemas"]["AgentReportSample"];
+            }[];
         };
     };
     responses: never;
@@ -2992,6 +3180,66 @@ export interface operations {
             };
         };
     };
+    getAgentMetricBlocksV2: {
+        parameters: {
+            query?: {
+                hours?: "1" | "6" | "12" | "24" | "168";
+            };
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Private metric archives: XHR1 + uint32LE metadata byte length + JSON metadata + ordered raw block bytes. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/vnd.xugou.metrics+binary": string;
+                };
+            };
+            /** @description Problem Details */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiProblem"];
+                };
+            };
+            /** @description Problem Details */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiProblem"];
+                };
+            };
+            /** @description Problem Details */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiProblem"];
+                };
+            };
+            /** @description Problem Details */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiProblem"];
+                };
+            };
+        };
+    };
     getLatestAgentMetricV2: {
         parameters: {
             query?: never;
@@ -3473,7 +3721,7 @@ export interface operations {
             };
         };
     };
-    acceptAgentReportV4: {
+    acceptAgentReport: {
         parameters: {
             query?: never;
             header?: never;
@@ -3482,7 +3730,8 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["AgentReportV4"];
+                "application/json": components["schemas"]["AgentReportV5"];
+                "application/vnd.xugou.report+binary": string;
             };
         };
         responses: {
@@ -3515,6 +3764,15 @@ export interface operations {
             };
             /** @description Problem Details */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiProblem"];
+                };
+            };
+            /** @description Problem Details */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3750,6 +4008,171 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PublicAgentMetricsResult"];
+                };
+            };
+            /** @description No content */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Problem Details */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiProblem"];
+                };
+            };
+            /** @description Problem Details */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiProblem"];
+                };
+            };
+            /** @description Problem Details */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiProblem"];
+                };
+            };
+        };
+    };
+    getPublicAgentMetricManifestV2: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                agentId: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Success */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicMetricManifest"];
+                };
+            };
+            /** @description No content */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Problem Details */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiProblem"];
+                };
+            };
+            /** @description Problem Details */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiProblem"];
+                };
+            };
+            /** @description Problem Details */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiProblem"];
+                };
+            };
+        };
+    };
+    getPublicAgentMetricHoursV2: {
+        parameters: {
+            query: {
+                /** @description 1 to 25 comma-separated hour starts in epoch seconds. */
+                buckets: string;
+            };
+            header?: never;
+            path: {
+                agentId: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Success */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicMetricHoursResult"];
+                };
+            };
+            /** @description Problem Details */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiProblem"];
+                };
+            };
+            /** @description Problem Details */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiProblem"];
+                };
+            };
+            /** @description Problem Details */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiProblem"];
+                };
+            };
+        };
+    };
+    getPublicAgentMetricHourV2: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                agentId: number;
+                bucketStart: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Success */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicMetricHourResult"];
                 };
             };
             /** @description No content */

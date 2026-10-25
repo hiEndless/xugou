@@ -15,7 +15,8 @@ Xugou Agent 是一个系统监控客户端，用于收集系统信息并上报�
 - 默认每 60 秒把本地 Spool 中的样本压缩为一个 HTTP 批次写入 D1
 - 支持自定义监控硬盘设备和网络设备
 - 支持配置文件和环境变量配置
-- 使用 v4 `report_id`、gzip 批次和最多 100 条样本的分块上报
+- 使用稳定 `report_id` 和 v6 二进制批次上报；指标块无需 Base64 或外层 gzip
+- 每分钟仅上传新增摘要，小时结束后封存一次聚合块；未封存小时可跨重启恢复
 - 使用 v2 Bearer 注册；Enrollment/Credential 只进入 Authorization Header，不进入 JSON Body
 - 采集结果先进入权限为 `0700/0600` 的持久化 Spool，进程重启后继续投递
 - Spool 有容量上限，网络重试使用指数退避和随机抖动
@@ -121,7 +122,7 @@ export XUGOU_UPDATE_MANIFEST_URL=https://mirror.example/latest/manifest.json
 
 1. 每次轻量采集同时进入最新值 WebSocket 通道与本地 Spool；文件中不保存 Agent Credential。
 2. WebSocket 断线只丢弃已过时的实时帧，Spool 与每 60 秒一次的 HTTP 批量上报继续运行。
-3. HTTP 上报按最老样本组批，最多 100 条且压缩后不超过配置上限；正常一分钟约为一个 60 条批次。
+3. HTTP 上报按最老样本的完整分钟桶组批，以 100 条为目标、最多 120 条，二进制请求体不超过配置上限；正常一分钟约为一个 60 条批次。
 4. 首次组批会原子保存 `inflight.json` 和 UUID `report_id`；HTTP 超时、5xx 与进程重启后重用相同信封。
 5. 服务端返回 2xx 后通过两阶段 Ack 清理样本；Ack 中途退出时，下一次启动会完成清理。
 6. 默认 Spool 上限为 64 MiB；达到上限时保留 inflight，并从最老的待组批样本开始清理，同时累计丢弃计数。
@@ -147,7 +148,7 @@ agent/
 ├── pkg/
 │   ├── collector/   # 数据收集器
 │   ├── realtime/    # 独立上行 WebSocket、最新值缓冲与实时网速
-│   ├── reporter/    # v4 gzip 数据上报器
+│   ├── reporter/    # v6 二进制上报器，兼容已持久化的 v5 gzip 批次
 │   └── spool/       # 持久化样本、稳定 report_id 与两阶段 Ack
 └── main.go          # 程序入口
 ```

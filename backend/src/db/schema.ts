@@ -453,9 +453,12 @@ export const agentMetricBlocks = sqliteTable(
     // 【实际存在】的槽数，用于 upsert 单调守卫；与块头里恒为 60 的 slot_count 不同
     point_count: int("point_count").notNull(),
     codec: int("codec").notNull(),
-    // length(data)，GC 统计预算时避免反复计算
+    // 二进制与摘要的总字节，GC 预算包含 v6 新增的摘要，避免实际容量超预算。
     byte_size: int("byte_size").notNull(),
     data: blob("data").notNull(),
+    // v6 分钟摘要与小时公开投影；归档二进制保持原样，读图无需重新解压。
+    summary_json: text("summary_json"),
+    public_json: text("public_json"),
   },
   (table) => ({
     keyIdx: uniqueIndex("agent_metric_blocks_key_idx").on(

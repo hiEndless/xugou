@@ -7,7 +7,6 @@ package spool
 
 import (
 	"bytes"
-	"compress/gzip"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
@@ -32,6 +31,7 @@ const (
 	DefaultMaxEntries                = 10_000
 	DefaultMaxSamples                = 100
 	DefaultMaxCompressedBytes        = 64 * 1024
+	maxReportSummarySegments         = 120
 	defaultBoundsCheckInterval       = 60
 	inflightFileName                 = "inflight.json"
 	stateFileName                    = "state.json"
@@ -56,10 +56,8 @@ type Store struct {
 	maxBytes             int64
 	maxEntries           int
 	addsSinceBoundsCheck int
-	// rollupPoints 累积尚未落盘的分钟聚合点（minuteStart -> point）。
-	// 进程重启即丢失，届时重传的聚合块会更短——服务端的单调守卫
-	// （excluded.point_count >= 现有值）会拒绝它，已有的完整块不受影响，
-	// 因此这里刻意不做持久化。
+	// rollupPoints 只保留尚未封存的小时；通过 inflight 与 Ack 状态恢复，
+	// 进程重启后继续累积，避免重复上传正在增长的整个小时。
 	rollupPoints map[int64]*metricblock.MinutePoint
 	// now 便于测试注入时钟。
 	now func() time.Time
@@ -80,12 +78,14 @@ type sampleRecord struct {
 }
 
 type inflightRecord struct {
-	Files  []string           `json:"files"`
-	Report *model.AgentReport `json:"report"`
+	Files        []string                           `json:"files"`
+	Report       *model.AgentReport                 `json:"report"`
+	RollupPoints map[int64]*metricblock.MinutePoint `json:"rollup_points"`
 }
 
 type persistedState struct {
-	DroppedSamples uint64 `json:"dropped_samples"`
+	DroppedSamples uint64                             `json:"dropped_samples"`
+	RollupPoints   map[int64]*metricblock.MinutePoint `json:"rollup_points,omitempty"`
 }
 
 func Open(options Options) (*Store, error) {
@@ -115,6 +115,13 @@ func Open(options Options) (*Store, error) {
 	// 顺序很重要：v4 的 inflight/样本会让下面每一步都直接报错退出。
 	if err := store.purgeIncompatible(); err != nil {
 		return nil, fmt.Errorf("清理不兼容 spool 文件失败: %w", err)
+	}
+	state, err := store.readState()
+	if err != nil {
+		return nil, fmt.Errorf("恢复 spool 状态失败: %w", err)
+	}
+	if state.RollupPoints != nil {
+		store.rollupPoints = state.RollupPoints
 	}
 	if err := store.recoverAcked(); err != nil {
 		return nil, fmt.Errorf("恢复已确认 spool 批次失败: %w", err)
@@ -234,7 +241,7 @@ func (s *Store) Next(maxSamples, maxCompressedBytes int) (*model.AgentReport, bo
 		if err != nil {
 			return nil, false, err
 		}
-		size, err := compressedSize(candidateReport)
+		size, err := reportSize(candidateReport)
 		if err != nil {
 			return nil, false, err
 		}
@@ -257,15 +264,9 @@ func (s *Store) Next(maxSamples, maxCompressedBytes int) (*model.AgentReport, bo
 		selected = append(selected, bucket.files...)
 	}
 
-	// 只有确定进入本批次的桶才计入聚合累积器
-	s.mergeRollupPoints(accepted)
-	if blocks, err := s.buildRollupBlocks(); err != nil {
-		return nil, false, err
-	} else {
-		report.Blocks = append(report.Blocks, blocks...)
-	}
-
-	inflight := inflightRecord{Files: selected, Report: report}
+	// 与 manifest 一起固化下一轮的累积器，只有整个批次确认后才提交到 state。
+	points := s.nextRollupPoints(accepted)
+	inflight := inflightRecord{Files: selected, Report: report, RollupPoints: points}
 	data, err := json.Marshal(inflight)
 	if err != nil {
 		return nil, false, fmt.Errorf("序列化 inflight 失败: %w", err)
@@ -273,6 +274,7 @@ func (s *Store) Next(maxSamples, maxCompressedBytes int) (*model.AgentReport, bo
 	if err := atomicWrite(filepath.Join(s.dir, inflightFileName), data); err != nil {
 		return nil, false, fmt.Errorf("写入 inflight 失败: %w", err)
 	}
+	s.rollupPoints = points
 	return report, true, nil
 }
 
@@ -348,6 +350,8 @@ type sampleBucket struct {
 	files   []string
 	samples []*model.AgentReportSample
 	latest  sampleRecord
+	block   *model.AgentReportBlock
+	point   *metricblock.MinutePoint
 }
 
 // collectBuckets 按分钟桶归拢待发样本，只返回【已完整】的桶——
@@ -401,22 +405,50 @@ func (s *Store) collectBuckets(files []string, maxSamples int) ([]*sampleBucket,
 		bucket.latest = record
 		total++
 	}
+	// 完整桶可以超过 maxSamples，但流量摘要最坏每个样本切一段，不能超过
+	// 协议的120段上限。只延后最后一整个桶，其样本文件留给下一批，避免截断。
+	for total > maxReportSummarySegments && len(buckets) > 1 {
+		last := buckets[len(buckets)-1]
+		total -= len(last.samples)
+		buckets = buckets[:len(buckets)-1]
+	}
 	return buckets, discarded, nil
 }
 
-// buildReport 把若干完整分钟桶编码成 v5 上报信封。
+// buildReport 把若干完整分钟桶编码成 v6 信封，桶内编码与聚合在大小试探间复用。
 func (s *Store) buildReport(reportID string, buckets []*sampleBucket) (*model.AgentReport, error) {
 	if len(buckets) == 0 {
 		return nil, errors.New("上报批次为空")
 	}
 	latest := buckets[len(buckets)-1].latest
 	blocks := make([]*model.AgentReportBlock, 0, len(buckets))
+	minutes := make([]*model.AgentReportMinuteSummary, 0, len(buckets))
 	for _, bucket := range buckets {
-		block, err := metricblock.Encode(bucket.start, bucket.samples)
-		if err != nil {
-			return nil, fmt.Errorf("编码 %d 分钟块失败: %w", bucket.start, err)
+		if bucket.block == nil {
+			block, err := metricblock.Encode(bucket.start, bucket.samples)
+			if err != nil {
+				return nil, fmt.Errorf("编码 %d 分钟块失败: %w", bucket.start, err)
+			}
+			bucket.block = toReportBlock(block)
+			bucket.point = metricblock.Aggregate(bucket.start, bucket.samples)
 		}
-		blocks = append(blocks, toReportBlock(block))
+		blocks = append(blocks, bucket.block)
+		if bucket.point == nil {
+			return nil, fmt.Errorf("分钟桶 %d 缺少有效聚合值", bucket.start)
+		}
+		minutes = append(minutes, &model.AgentReportMinuteSummary{
+			BucketStart: bucket.start, PointCount: bucket.block.PointCount,
+			Avg: bucket.point.AverageSample(bucket.latest.Sample),
+		})
+	}
+	rollups, err := s.sealedRollupBlocks(buckets)
+	if err != nil {
+		return nil, err
+	}
+	blocks = append(blocks, rollups...)
+	summary, err := summarizeReport(buckets)
+	if err != nil {
+		return nil, err
 	}
 	return &model.AgentReport{
 		ProtocolVersion:       model.AgentReportProtocolVersion,
@@ -431,6 +463,8 @@ func (s *Store) buildReport(reportID string, buckets []*sampleBucket) (*model.Ag
 		ReportIntervalSeconds: latest.ReportIntervalSeconds,
 		Blocks:                blocks,
 		Latest:                latest.Sample,
+		MinuteSummaries:       minutes,
+		Summary:               summary,
 	}, nil
 }
 
@@ -441,35 +475,31 @@ func toReportBlock(block *metricblock.Block) *model.AgentReportBlock {
 		PointCount:  block.PointCount,
 		Codec:       int(metricblock.CodecVersion),
 		Data:        base64.StdEncoding.EncodeToString(block.Data),
+		RawData:     block.Data,
 	}
 }
 
-// mergeRollupPoints 把进入本批次的分钟桶聚合后并入累积器。
-// 键是分钟起点，重复处理同一分钟是幂等的。
-func (s *Store) mergeRollupPoints(buckets []*sampleBucket) {
+func (s *Store) rollupPointsWith(buckets []*sampleBucket) map[int64]*metricblock.MinutePoint {
+	points := make(map[int64]*metricblock.MinutePoint, len(s.rollupPoints)+len(buckets))
+	for minute, point := range s.rollupPoints {
+		points[minute] = point
+	}
 	for _, bucket := range buckets {
-		if point := metricblock.Aggregate(bucket.start, bucket.samples); point != nil {
-			s.rollupPoints[bucket.start] = point
+		if bucket.point != nil {
+			points[bucket.start] = bucket.point
 		}
 	}
+	return points
 }
 
-// buildRollupBlocks 为累积器里出现的每个小时生成一个聚合块，随后只保留
-// 最新一个小时的点：更早的小时已经完整，不会再有新分钟加入。
-//
-// 当前小时的块每轮都会带着全部已知分钟重发一次（最多 60 点约 1.5 KB），
-// 服务端按 (agent_id, 60, hourStart) upsert，越发越完整。
-func (s *Store) buildRollupBlocks() ([]*model.AgentReportBlock, error) {
-	if len(s.rollupPoints) == 0 {
-		return nil, nil
-	}
+// sealedRollupBlocks 只编码已处理水位之前的完整小时；当前小时由分钟摘要承载。
+func (s *Store) sealedRollupBlocks(buckets []*sampleBucket) ([]*model.AgentReportBlock, error) {
+	watermark := buckets[len(buckets)-1].start + 60
 	byHour := make(map[int64][]*metricblock.MinutePoint)
-	var latestHour int64
-	for minute, point := range s.rollupPoints {
+	for minute, point := range s.rollupPointsWith(buckets) {
 		hour := metricblock.BucketStartFor(minute, 60)
-		byHour[hour] = append(byHour[hour], point)
-		if hour > latestHour {
-			latestHour = hour
+		if hour+3600 <= watermark {
+			byHour[hour] = append(byHour[hour], point)
 		}
 	}
 
@@ -492,12 +522,18 @@ func (s *Store) buildRollupBlocks() ([]*model.AgentReportBlock, error) {
 		blocks = append(blocks, toReportBlock(block))
 	}
 
-	for minute := range s.rollupPoints {
-		if metricblock.BucketStartFor(minute, 60) != latestHour {
-			delete(s.rollupPoints, minute)
+	return blocks, nil
+}
+
+func (s *Store) nextRollupPoints(buckets []*sampleBucket) map[int64]*metricblock.MinutePoint {
+	points := s.rollupPointsWith(buckets)
+	watermark := buckets[len(buckets)-1].start + 60
+	for minute := range points {
+		if metricblock.BucketStartFor(minute, 60)+3600 <= watermark {
+			delete(points, minute)
 		}
 	}
-	return blocks, nil
+	return points
 }
 
 func (s *Store) enforceBounds() (uint64, error) {
@@ -672,6 +708,9 @@ func (s *Store) readInflight() (*inflightRecord, error) {
 			return nil, fmt.Errorf("inflight 引用样本 %q 失败: %w", name, err)
 		}
 	}
+	if record.RollupPoints != nil {
+		s.rollupPoints = record.RollupPoints
+	}
 	return &record, nil
 }
 
@@ -709,6 +748,21 @@ func (s *Store) recoverAcked() error {
 		var record inflightRecord
 		if err := strictJSON(raw, &record); err != nil {
 			return fmt.Errorf("解析已确认 manifest %q 失败: %w", name, err)
+		}
+		if record.RollupPoints != nil {
+			state, err := s.readState()
+			if err != nil {
+				return err
+			}
+			state.RollupPoints = record.RollupPoints
+			encoded, err := json.Marshal(state)
+			if err != nil {
+				return err
+			}
+			if err := atomicWrite(filepath.Join(s.dir, stateFileName), encoded); err != nil {
+				return err
+			}
+			s.rollupPoints = record.RollupPoints
 		}
 		for _, sampleName := range record.Files {
 			if !isSampleFile(sampleName) {
@@ -752,23 +806,12 @@ func strictJSON(raw []byte, target any) error {
 	return nil
 }
 
-func compressedSize(value any) (int, error) {
-	data, err := json.Marshal(value)
+func reportSize(report *model.AgentReport) (int, error) {
+	data, err := model.EncodeBinaryReport(report)
 	if err != nil {
 		return 0, err
 	}
-	var buffer bytes.Buffer
-	writer, err := gzip.NewWriterLevel(&buffer, gzip.BestSpeed)
-	if err != nil {
-		return 0, err
-	}
-	if _, err := writer.Write(data); err != nil {
-		return 0, err
-	}
-	if err := writer.Close(); err != nil {
-		return 0, err
-	}
-	return buffer.Len(), nil
+	return len(data), nil
 }
 
 func newSampleFileName(timestamp time.Time) (string, error) {

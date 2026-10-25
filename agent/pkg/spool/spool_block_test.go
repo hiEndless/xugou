@@ -75,6 +75,46 @@ func blocksByResolution(report *model.AgentReport, resolution int) []*model.Agen
 	return out
 }
 
+func TestNextBoundsTopologySegmentsWithoutSplittingMinutes(t *testing.T) {
+	minute := metricblock.BucketStartFor(anchor, 60) + 600
+	store := newStore(t, time.Unix(minute+180, 0))
+	// A partial first minute plus two complete minutes can otherwise yield
+	// 30+60+60=150 samples, each creating a different traffic topology segment.
+	for i := 0; i < 150; i++ {
+		info := sampleAt(minute + 30 + int64(i))
+		if i%2 == 0 {
+			info.Network = nil
+		}
+		if _, err := store.Add(info); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, ok, err := store.Next(DefaultMaxSamples, DefaultMaxCompressedBytes)
+	if err != nil || !ok {
+		t.Fatalf("首批必须能推进: ok=%v err=%v", ok, err)
+	}
+	if first.SampleCount() != 90 || len(first.Summary.Traffic) != 90 {
+		t.Fatalf("首批应保留完整30+60样本，实际样本%d、摘要段%d", first.SampleCount(), len(first.Summary.Traffic))
+	}
+	if err := store.Ack(first.ReportID); err != nil {
+		t.Fatal(err)
+	}
+	second, ok, err := store.Next(DefaultMaxSamples, DefaultMaxCompressedBytes)
+	if err != nil || !ok {
+		t.Fatalf("末分钟必须留给下一批: ok=%v err=%v", ok, err)
+	}
+	if second.SampleCount() != 60 || len(second.Summary.Traffic) != 60 {
+		t.Fatalf("末分钟不能丢失或截断，实际样本%d、摘要段%d", second.SampleCount(), len(second.Summary.Traffic))
+	}
+	if err := store.Ack(second.ReportID); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := store.Stats()
+	if err != nil || stats.Samples != 0 {
+		t.Fatalf("150个样本确认后不应残留，stats=%+v err=%v", stats, err)
+	}
+}
+
 func decodeReportBlock(t *testing.T, block *model.AgentReportBlock) *metricblock.DecodedBlock {
 	t.Helper()
 	raw, err := base64.StdEncoding.DecodeString(block.Data)
@@ -210,101 +250,81 @@ func TestBucketsAreAtomic(t *testing.T) {
 	}
 }
 
-// TestRollupBlockGrowsAcrossReports 验证 1 分钟聚合块随轮次累积变长，
-// 且服务端可以靠 point_count 单调递增来接受更完整的版本。
-func TestRollupBlockGrowsAcrossReports(t *testing.T) {
-	m0 := minuteStart(0)
-	store := newStore(t, time.Unix(m0+60, 0))
-
-	addRange(t, store, m0, 60)
+// TestRollupUploadedOnlyWhenHourSeals 确保当前小时只传新增分钟摘要，小时结束只编码一次。
+func TestRollupUploadedOnlyWhenHourSeals(t *testing.T) {
+	hour := metricblock.BucketStartFor(anchor, 60)
+	store := newStore(t, time.Unix(hour+60, 0))
+	for _, minute := range []int64{hour, hour + 60, hour + 59*60} {
+		store.now = func() time.Time { return time.Unix(minute+60, 0) }
+		addRange(t, store, minute, 60)
+		report, ok, err := store.Next(DefaultMaxSamples, 1<<20)
+		if err != nil || !ok {
+			t.Fatalf("Next 失败: ok=%v err=%v", ok, err)
+		}
+		if len(report.MinuteSummaries) != 1 || report.MinuteSummaries[0].BucketStart != minute {
+			t.Fatalf("每轮只应含新增分钟摘要: %+v", report.MinuteSummaries)
+		}
+		rollups := blocksByResolution(report, 60)
+		if minute == hour+59*60 {
+			if len(rollups) != 1 || rollups[0].PointCount != 3 {
+				t.Fatalf("小时结束应只封存一次，共3个稀疏分钟: %+v", rollups)
+			}
+			decoded := decodeReportBlock(t, rollups[0])
+			if decoded.AggCount != 3 || decoded.Interval != 60 {
+				t.Fatalf("小时块编码错误: %+v", decoded)
+			}
+		} else if len(rollups) != 0 {
+			t.Fatalf("当前小时不应重复上传聚合块: %+v", rollups)
+		}
+		if err := store.Ack(report.ReportID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(store.rollupPoints) != 0 {
+		t.Fatalf("封存小时应立即从累积器移除，实际剩%d", len(store.rollupPoints))
+	}
+	addRange(t, store, hour+3600, 10)
+	store.now = func() time.Time { return time.Unix(hour+3660, 0) }
 	report, ok, err := store.Next(DefaultMaxSamples, 1<<20)
 	if err != nil || !ok {
-		t.Fatalf("首轮 Next 失败: ok=%v err=%v", ok, err)
+		t.Fatalf("新小时 Next 失败: %v", err)
 	}
-	rollup := blocksByResolution(report, 60)
-	if len(rollup) != 1 {
-		t.Fatalf("期望 1 个聚合块，实际 %d", len(rollup))
-	}
-	if rollup[0].PointCount != 1 {
-		t.Fatalf("首轮聚合块应含 1 个分钟点，实际 %d", rollup[0].PointCount)
-	}
-	firstHour := rollup[0].BucketStart
-	if firstHour != metricblock.BucketStartFor(m0, 60) {
-		t.Fatalf("聚合块应按小时对齐，实际 %d", firstHour)
-	}
-	if err := store.Ack(report.ReportID); err != nil {
-		t.Fatalf("Ack 失败: %v", err)
-	}
-
-	// 第二轮：再加一分钟，聚合块应变成 2 个点且小时桶不变
-	store.now = func() time.Time { return time.Unix(m0+120, 0) }
-	addRange(t, store, m0+60, 60)
-	report, ok, err = store.Next(DefaultMaxSamples, 1<<20)
-	if err != nil || !ok {
-		t.Fatalf("次轮 Next 失败: ok=%v err=%v", ok, err)
-	}
-	rollup = blocksByResolution(report, 60)
-	if len(rollup) != 1 {
-		t.Fatalf("期望 1 个聚合块，实际 %d", len(rollup))
-	}
-	if rollup[0].BucketStart != firstHour {
-		t.Fatalf("仍在同一小时，桶起点不应变化")
-	}
-	if rollup[0].PointCount != 2 {
-		t.Fatalf("次轮聚合块应含 2 个分钟点，实际 %d", rollup[0].PointCount)
-	}
-
-	decoded := decodeReportBlock(t, rollup[0])
-	if decoded.AggCount != 3 {
-		t.Fatalf("聚合块应有 3 个聚合位，实际 %d", decoded.AggCount)
-	}
-	if decoded.Interval != 60 {
-		t.Fatalf("聚合块 interval 应为 60，实际 %d", decoded.Interval)
+	if len(blocksByResolution(report, 60)) != 0 || len(store.rollupPoints) != 1 {
+		t.Fatal("新小时只能保留新增分钟，不应再次上传已封存小时")
 	}
 }
 
-// TestRollupPrunesPreviousHour 验证跨小时后旧小时的点被清理，
-// 否则累积器会随运行时长无限增长。
-func TestRollupPrunesPreviousHour(t *testing.T) {
-	hour0 := metricblock.BucketStartFor(anchor, 60)
-	lastMinute := hour0 + 59*60
-	store := newStore(t, time.Unix(lastMinute+60, 0))
-
-	addRange(t, store, lastMinute, 10)
-	report, ok, err := store.Next(DefaultMaxSamples, 1<<20)
+// TestRollupWatermarkFollowsBacklog 验证离线积压不能按现在时刻提前封存历史小时。
+func TestRollupWatermarkFollowsBacklog(t *testing.T) {
+	hour := metricblock.BucketStartFor(anchor, 60)
+	store := newStore(t, time.Unix(hour+7200, 0))
+	addRange(t, store, hour, 60)
+	addRange(t, store, hour+60, 60)
+	report, ok, err := store.Next(60, 1<<20)
 	if err != nil || !ok {
-		t.Fatalf("首轮 Next 失败: ok=%v err=%v", ok, err)
+		t.Fatalf("Next 失败: %v", err)
+	}
+	if len(blocksByResolution(report, 60)) != 0 {
+		t.Fatal("积压尚未处理完整小时，不能封存第一个分钟")
 	}
 	if err := store.Ack(report.ReportID); err != nil {
-		t.Fatalf("Ack 失败: %v", err)
+		t.Fatal(err)
 	}
-	if len(store.rollupPoints) != 1 {
-		t.Fatalf("首轮后累积器应有 1 个点，实际 %d", len(store.rollupPoints))
+	// 重启后继续累积旧小时，不丢失已确认分钟。
+	reopened, err := Open(Options{Dir: store.dir})
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	// 跨到下一个小时
-	nextHourMinute := hour0 + 3600
-	store.now = func() time.Time { return time.Unix(nextHourMinute+60, 0) }
-	addRange(t, store, nextHourMinute, 10)
-	report, ok, err = store.Next(DefaultMaxSamples, 1<<20)
+	reopened.now = store.now
+	if len(reopened.rollupPoints) != 1 {
+		t.Fatalf("重启应恢复1个已确认分钟，实际%d", len(reopened.rollupPoints))
+	}
+	report, ok, err = reopened.Next(60, 1<<20)
 	if err != nil || !ok {
-		t.Fatalf("次轮 Next 失败: ok=%v err=%v", ok, err)
+		t.Fatalf("重启后 Next 失败: %v", err)
 	}
-	rollup := blocksByResolution(report, 60)
-	if len(rollup) != 2 {
-		t.Fatalf("跨小时时应同时发出两个小时的聚合块，实际 %d", len(rollup))
-	}
-	if rollup[0].BucketStart != hour0 || rollup[1].BucketStart != hour0+3600 {
-		t.Fatalf("聚合块小时顺序错误: %d, %d", rollup[0].BucketStart, rollup[1].BucketStart)
-	}
-	// 旧小时已完整，不应继续留在累积器里
-	if len(store.rollupPoints) != 1 {
-		t.Fatalf("跨小时后累积器应只剩当前小时的 1 个点，实际 %d", len(store.rollupPoints))
-	}
-	for minute := range store.rollupPoints {
-		if metricblock.BucketStartFor(minute, 60) != hour0+3600 {
-			t.Fatalf("累积器残留了旧小时的点: %d", minute)
-		}
+	if len(blocksByResolution(report, 60)) != 0 || len(reopened.rollupPoints) != 2 {
+		t.Fatal("第二个历史分钟仍只能累积，不能提前封存")
 	}
 }
 
@@ -409,5 +429,23 @@ func TestInflightSurvivesRestart(t *testing.T) {
 	}
 	if firstHot[0].Data != secondHot[0].Data {
 		t.Fatal("重启后块内容应逐字节不变")
+	}
+	if err := reopened.Ack(second.ReportID); err != nil {
+		t.Fatal(err)
+	}
+	// 在重启恢复的未确认分钟之后封存小时，必须包含恢复前的聚合点。
+	hour := metricblock.BucketStartFor(m0, 60)
+	lastMinute := hour + 59*60
+	if lastMinute > m0 {
+		addRange(t, reopened, lastMinute, 5)
+		reopened.now = func() time.Time { return time.Unix(hour+3600, 0) }
+		sealed, ok, err := reopened.Next(DefaultMaxSamples, 1<<20)
+		if err != nil || !ok {
+			t.Fatalf("封存恢复的小时失败: %v", err)
+		}
+		rollups := blocksByResolution(sealed, 60)
+		if len(rollups) != 1 || rollups[0].PointCount != 2 {
+			t.Fatal("重启后封存必须保留先前inflight携带的聚合分钟")
+		}
 	}
 }

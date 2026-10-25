@@ -379,6 +379,13 @@
       "when": 1790908031262,
       "tag": "0053_sticky_mauler",
       "breakpoints": true
+    },
+    {
+      "idx": 54,
+      "version": "6",
+      "when": 1792945924170,
+      "tag": "0054_nifty_ken_ellis",
+      "breakpoints": true
     }
   ]
 }

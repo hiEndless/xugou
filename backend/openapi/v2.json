@@ -1961,6 +1961,94 @@
         ]
       }
     },
+    "/api/v2/agents/{id}/metrics/blocks": {
+      "get": {
+        "operationId": "getAgentMetricBlocksV2",
+        "tags": [
+          "agents"
+        ],
+        "responses": {
+          "200": {
+            "description": "Private metric archives: XHR1 + uint32LE metadata byte length + JSON metadata + ordered raw block bytes.",
+            "content": {
+              "application/vnd.xugou.metrics+binary": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Problem Details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Problem Details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Problem Details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Problem Details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            }
+          },
+          {
+            "name": "hours",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "1",
+                "6",
+                "12",
+                "24",
+                "168"
+              ],
+              "default": "24"
+            }
+          }
+        ]
+      }
+    },
     "/api/v2/agents/{id}/metrics/latest": {
       "get": {
         "operationId": "getLatestAgentMetricV2",
@@ -2595,7 +2683,7 @@
     },
     "/api/v2/agents/reports": {
       "post": {
-        "operationId": "acceptAgentReportV4",
+        "operationId": "acceptAgentReport",
         "tags": [
           "agents"
         ],
@@ -2640,6 +2728,16 @@
               }
             }
           },
+          "422": {
+            "description": "Problem Details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
           "503": {
             "description": "Problem Details",
             "content": {
@@ -2661,7 +2759,14 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/AgentReportV4"
+                "$ref": "#/components/schemas/AgentReportV5"
+              }
+            },
+            "application/vnd.xugou.report+binary": {
+              "schema": {
+                "type": "string",
+                "format": "binary",
+                "description": "v6: XG06 + uint32LE metadata JSON byte length + UTF-8 metadata (AgentReportV6Metadata) + ordered compressed block bytes. No outer content encoding."
               }
             }
           }
@@ -2987,6 +3092,220 @@
               "type": "integer",
               "minimum": 1,
               "maximum": 9007199254740991
+            }
+          }
+        ]
+      }
+    },
+    "/api/v2/status/public/agents/{agentId}/metrics/manifest": {
+      "get": {
+        "operationId": "getPublicAgentMetricManifestV2",
+        "tags": [
+          "status"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicMetricManifest"
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "No content"
+          },
+          "400": {
+            "description": "Problem Details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Problem Details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Problem Details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          }
+        },
+        "security": [],
+        "parameters": [
+          {
+            "name": "agentId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            }
+          }
+        ]
+      }
+    },
+    "/api/v2/status/public/agents/{agentId}/metrics/hours": {
+      "get": {
+        "operationId": "getPublicAgentMetricHoursV2",
+        "tags": [
+          "status"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicMetricHoursResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Problem Details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Problem Details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Problem Details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          }
+        },
+        "security": [],
+        "parameters": [
+          {
+            "name": "agentId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            }
+          },
+          {
+            "name": "buckets",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 300
+            },
+            "description": "1 to 25 comma-separated hour starts in epoch seconds."
+          }
+        ]
+      }
+    },
+    "/api/v2/status/public/agents/{agentId}/metrics/hours/{bucketStart}": {
+      "get": {
+        "operationId": "getPublicAgentMetricHourV2",
+        "tags": [
+          "status"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicMetricHourResult"
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "No content"
+          },
+          "400": {
+            "description": "Problem Details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Problem Details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Problem Details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiProblem"
+                }
+              }
+            }
+          }
+        },
+        "security": [],
+        "parameters": [
+          {
+            "name": "agentId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            }
+          },
+          {
+            "name": "bucketStart",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
             }
           }
         ]
@@ -6929,17 +7248,54 @@
           }
         }
       },
-      "AgentReportV4": {
+      "AgentReportBlock": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "resolution",
+          "bucket_start",
+          "point_count",
+          "codec",
+          "data"
+        ],
+        "properties": {
+          "resolution": {
+            "type": "integer",
+            "enum": [
+              1,
+              60
+            ]
+          },
+          "bucket_start": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295
+          },
+          "point_count": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 60
+          },
+          "codec": {
+            "const": 1
+          },
+          "data": {
+            "type": "string",
+            "maxLength": 262144
+          }
+        }
+      },
+      "AgentReportV5": {
         "type": "object",
         "additionalProperties": false,
         "required": [
           "protocol_version",
           "report_id",
-          "samples"
+          "blocks"
         ],
         "properties": {
           "protocol_version": {
-            "const": 4
+            "const": 5
           },
           "agent_version": {
             "type": "string",
@@ -6997,12 +7353,220 @@
             "minimum": 10,
             "maximum": 3600
           },
-          "samples": {
+          "blocks": {
             "type": "array",
             "minItems": 1,
-            "maxItems": 100,
+            "maxItems": 120,
             "items": {
-              "$ref": "#/components/schemas/AgentReportSample"
+              "$ref": "#/components/schemas/AgentReportBlock"
+            }
+          },
+          "latest": {
+            "$ref": "#/components/schemas/AgentReportSample"
+          }
+        }
+      },
+      "PublicMinutePoint": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "c",
+          "m",
+          "l",
+          "s",
+          "p",
+          "t",
+          "u",
+          "v4",
+          "v6",
+          "d",
+          "n"
+        ],
+        "properties": {
+          "c": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "p": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "t": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "u": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "v4": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "v6": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "m": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "minItems": 4,
+            "maxItems": 4
+          },
+          "l": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "s": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "d": {
+            "type": "array",
+            "maxItems": 128,
+            "items": {
+              "type": "array",
+              "items": {
+                "type": [
+                  "string",
+                  "number",
+                  "null"
+                ]
+              },
+              "minItems": 5,
+              "maxItems": 5
+            }
+          },
+          "n": {
+            "type": "array",
+            "maxItems": 128,
+            "items": {
+              "type": "array",
+              "items": {
+                "type": [
+                  "string",
+                  "number",
+                  "null"
+                ]
+              },
+              "minItems": 5,
+              "maxItems": 5
+            }
+          }
+        }
+      },
+      "PublicMetricManifest": {
+        "type": "object",
+        "required": [
+          "success",
+          "agent_id",
+          "from",
+          "to",
+          "hours"
+        ],
+        "properties": {
+          "success": {
+            "const": true
+          },
+          "agent_id": {
+            "type": "integer"
+          },
+          "from": {
+            "type": "integer"
+          },
+          "to": {
+            "type": "integer"
+          },
+          "hours": {
+            "type": "array",
+            "maxItems": 25,
+            "items": {
+              "type": "object",
+              "required": [
+                "bucket_start",
+                "revision"
+              ],
+              "properties": {
+                "bucket_start": {
+                  "type": "integer"
+                },
+                "revision": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "PublicMetricHourResult": {
+        "type": "object",
+        "required": [
+          "success",
+          "agent_id",
+          "bucket_start",
+          "chunk"
+        ],
+        "properties": {
+          "success": {
+            "const": true
+          },
+          "agent_id": {
+            "type": "integer"
+          },
+          "bucket_start": {
+            "type": "integer"
+          },
+          "chunk": {
+            "type": "object",
+            "required": [
+              "v",
+              "r",
+              "p"
+            ],
+            "properties": {
+              "v": {
+                "const": 1
+              },
+              "r": {
+                "type": "integer"
+              },
+              "p": {
+                "type": "object",
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/PublicMinutePoint"
+                }
+              }
             }
           }
         }
@@ -8120,6 +8684,402 @@
           },
           "has_more": {
             "type": "boolean"
+          }
+        }
+      },
+      "PublicMetricHourChunk": {
+        "type": "object",
+        "required": [
+          "v",
+          "r",
+          "p"
+        ],
+        "properties": {
+          "v": {
+            "const": 1
+          },
+          "r": {
+            "type": "integer"
+          },
+          "p": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/PublicMinutePoint"
+            }
+          }
+        }
+      },
+      "PublicMetricHoursResult": {
+        "type": "object",
+        "required": [
+          "success",
+          "agent_id",
+          "hours",
+          "missing"
+        ],
+        "properties": {
+          "success": {
+            "const": true
+          },
+          "agent_id": {
+            "type": "integer"
+          },
+          "hours": {
+            "type": "array",
+            "maxItems": 25,
+            "items": {
+              "type": "object",
+              "required": [
+                "bucket_start",
+                "chunk"
+              ],
+              "properties": {
+                "bucket_start": {
+                  "type": "integer"
+                },
+                "chunk": {
+                  "$ref": "#/components/schemas/PublicMetricHourChunk"
+                }
+              }
+            }
+          },
+          "missing": {
+            "type": "array",
+            "maxItems": 25,
+            "items": {
+              "type": "integer"
+            }
+          }
+        }
+      },
+      "AgentTrafficInterfaceSummary": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "first_ts",
+          "last_ts",
+          "first_rx",
+          "first_tx",
+          "last_rx",
+          "last_tx",
+          "delta_rx",
+          "delta_tx"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "first_ts": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295999
+          },
+          "last_ts": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295999
+          },
+          "first_rx": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "first_tx": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "last_rx": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "last_tx": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "delta_rx": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "delta_tx": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          }
+        }
+      },
+      "AgentReportSummary": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "first_ts",
+          "last_ts",
+          "cpu_usage_peak",
+          "memory_usage_peak",
+          "disk_usage_peak",
+          "traffic"
+        ],
+        "properties": {
+          "first_ts": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295999
+          },
+          "last_ts": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295999
+          },
+          "cpu_usage_peak": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "minimum": 0,
+            "maximum": 100
+          },
+          "memory_usage_peak": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "minimum": 0,
+            "maximum": 100
+          },
+          "disk_usage_peak": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "minimum": 0,
+            "maximum": 100
+          },
+          "traffic": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 120,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "utc_day",
+                "first_ts",
+                "last_ts",
+                "interfaces",
+                "last_speed"
+              ],
+              "properties": {
+                "utc_day": {
+                  "type": "string",
+                  "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+                },
+                "first_ts": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295999
+                },
+                "last_ts": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295999
+                },
+                "interfaces": {
+                  "type": "array",
+                  "maxItems": 128,
+                  "items": {
+                    "$ref": "#/components/schemas/AgentTrafficInterfaceSummary"
+                  }
+                },
+                "last_speed": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "rx",
+                        "tx"
+                      ],
+                      "properties": {
+                        "rx": {
+                          "type": [
+                            "number",
+                            "null"
+                          ],
+                          "minimum": 0
+                        },
+                        "tx": {
+                          "type": [
+                            "number",
+                            "null"
+                          ],
+                          "minimum": 0
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "AgentReportV6Metadata": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "protocol_version",
+          "report_id",
+          "blocks",
+          "latest",
+          "minute_summaries",
+          "summary"
+        ],
+        "properties": {
+          "protocol_version": {
+            "const": 6
+          },
+          "agent_version": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "report_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "hostname": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 255
+          },
+          "ip_addresses": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          "os": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 128
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 128
+          },
+          "boot_time": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "keepalive_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 86400
+          },
+          "report_interval_seconds": {
+            "type": "integer",
+            "minimum": 10,
+            "maximum": 3600
+          },
+          "blocks": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 120,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "resolution",
+                "bucket_start",
+                "point_count",
+                "codec",
+                "byte_length"
+              ],
+              "properties": {
+                "resolution": {
+                  "type": "integer",
+                  "enum": [
+                    1,
+                    60
+                  ]
+                },
+                "bucket_start": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295
+                },
+                "point_count": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 60
+                },
+                "codec": {
+                  "const": 1
+                },
+                "byte_length": {
+                  "type": "integer",
+                  "minimum": 32,
+                  "maximum": 196608
+                }
+              }
+            }
+          },
+          "latest": {
+            "$ref": "#/components/schemas/AgentReportSample"
+          },
+          "summary": {
+            "$ref": "#/components/schemas/AgentReportSummary"
+          },
+          "minute_summaries": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 120,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "bucket_start",
+                "point_count",
+                "avg"
+              ],
+              "properties": {
+                "bucket_start": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295
+                },
+                "point_count": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 60
+                },
+                "avg": {
+                  "$ref": "#/components/schemas/AgentReportSample"
+                }
+              }
+            }
           }
         }
       }

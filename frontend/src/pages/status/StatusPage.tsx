@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { Box, Grid } from "@/components/ui/layout";
 import { getPublicAgentMetrics, getStatusPageData } from "../../api/status";
 import PageLoading from "../../components/PageLoading";
@@ -11,7 +11,6 @@ import { useTranslation } from "react-i18next";
 import {
   PublicMonitor,
   MetricHistory,
-  PublicMetricHistory,
   AgentWithLatestMetrics,
 } from "../../types";
 import type { StatusPageData } from "../../types/status";
@@ -32,13 +31,8 @@ interface StatusLiveState {
 const StatusPage = () => {
   const { t } = useTranslation();
   const { setThemeOverride } = useTheme();
-  const queryClient = useQueryClient();
   const [selectedAgent, setSelectedAgent] =
     useState<AgentWithLatestMetrics | null>(null);
-  const [selectedAgentMetrics, setSelectedAgentMetrics] = useState<
-    PublicMetricHistory[] | null
-  >(null);
-  const [cardLoading, setCardLoading] = useState(false);
   const [liveState, setLiveState] = useState<Record<number, StatusLiveState>>({});
   const [liveConnected, setLiveConnected] = useState(false);
   const statusQuery = useQuery({
@@ -47,6 +41,16 @@ const StatusPage = () => {
     // Publication 是断线兜底；公开白名单指标由下方 WebSocket 实时叠加。
     refetchInterval: 60_000,
   });
+  const selectedAgentId = selectedAgent?.id;
+  const historyQuery = useQuery({
+    queryKey: ["status", "public", "agent-metrics", selectedAgentId],
+    queryFn: ({ signal }) => getPublicAgentMetrics(selectedAgentId!, signal),
+    enabled: selectedAgentId !== undefined,
+    staleTime: 60_000,
+    refetchInterval: 60_000,
+  });
+  const selectedAgentMetrics = historyQuery.data?.agent ?? [];
+  const cardLoading = historyQuery.isPending;
   const baseAgents = useMemo(
     () =>
       statusQuery.data?.agents.map((agent: StatusPageData["agents"][number]) => ({
@@ -135,29 +139,14 @@ const StatusPage = () => {
   }, [setThemeOverride]);
 
   // 点击 agent 卡片时，获取完整指标
-  const handleAgentClick = async (agent: AgentWithLatestMetrics) => {
+  const handleAgentClick = (agent: AgentWithLatestMetrics) => {
     // 如果点击的是当前展开的 agent，则收起
     if (selectedAgent?.id === agent.id) {
       setSelectedAgent(null);
-      setSelectedAgentMetrics(null);
       return;
     }
 
     setSelectedAgent(agent);
-    setCardLoading(true);
-    setSelectedAgentMetrics(null);
-    try {
-      const metricsRes = await queryClient.fetchQuery({
-        queryKey: ["status", "public", "agent-metrics", agent.id],
-        queryFn: ({ signal }) => getPublicAgentMetrics(agent.id, signal),
-        staleTime: 60_000,
-      });
-      setSelectedAgentMetrics(metricsRes.success ? metricsRes.agent || [] : []);
-    } catch {
-      setSelectedAgentMetrics([]);
-    } finally {
-      setCardLoading(false);
-    }
   };
 
   // 供多视图组件回调：按 id 找到 agent 后走原有展开/收起逻辑

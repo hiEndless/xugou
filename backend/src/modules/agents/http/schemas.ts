@@ -248,3 +248,50 @@ export const agentV5ReportSchema = z
     latest: agentReportSampleSchema.optional(),
   })
   .strict();
+
+const timestampMs = z.number().int().min(0).max(4_294_967_295_999);
+const nullablePercent = percentMetric.nullable();
+const trafficInterfaceSummarySchema = z.object({
+  name: z.string().min(1).max(512),
+  first_ts: timestampMs,
+  last_ts: timestampMs,
+  first_rx: boundedMetric,
+  first_tx: boundedMetric,
+  last_rx: boundedMetric,
+  last_tx: boundedMetric,
+  delta_rx: boundedMetric,
+  delta_tx: boundedMetric,
+}).strict().refine(value => value.first_ts <= value.last_ts);
+
+const reportSummarySchema = z.object({
+  first_ts: timestampMs,
+  last_ts: timestampMs,
+  cpu_usage_peak: nullablePercent,
+  memory_usage_peak: nullablePercent,
+  disk_usage_peak: nullablePercent,
+  traffic: z.array(z.object({
+    utc_day: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+    first_ts: timestampMs,
+    last_ts: timestampMs,
+    interfaces: z.array(trafficInterfaceSummarySchema).max(128),
+    last_speed: z.object({ rx: boundedMetric.nullable(), tx: boundedMetric.nullable() }).strict().nullable(),
+  }).strict()).min(1).max(120),
+}).strict().refine(value => value.first_ts <= value.last_ts);
+
+/** v6 的 JSON 只描述元数据；压缩块字节紧随元数据，无 Base64/外层 gzip。 */
+export const agentV6ReportMetadataSchema = agentV5ReportSchema.omit({
+  protocol_version: true,
+  blocks: true,
+}).extend({
+  protocol_version: z.literal(6),
+  blocks: z.array(agentReportBlockSchema.omit({ data: true }).extend({
+    byte_length: z.number().int().min(32).max(196_608),
+  })).min(1).max(120),
+  latest: agentReportSampleSchema,
+  summary: reportSummarySchema,
+  minute_summaries: z.array(z.object({
+    bucket_start: z.number().int().min(0).max(4_294_967_295),
+    point_count: z.number().int().min(1).max(60),
+    avg: agentReportSampleSchema,
+  }).strict()).min(1).max(120),
+}).strict();

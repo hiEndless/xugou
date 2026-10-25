@@ -29,16 +29,11 @@ export interface AgentCredentialDigestPort {
   digest(token: string): Promise<string>;
 }
 
-export interface ReportDigestPort {
-  digest(report: AgentReportCommand): Promise<string>;
-}
-
 export interface AgentReportIngestorPort {
   process(
     agentId: number,
     report: AgentReportCommand,
     input: {
-      payloadDigest: string;
       receivedAt: string;
       sourceLocation?: AgentReportSourceLocation;
     }
@@ -56,7 +51,6 @@ export class AgentUseCases {
   constructor(
     private readonly repository: AgentRepositoryPort,
     private readonly credentialDigest: AgentCredentialDigestPort,
-    private readonly reportDigest: ReportDigestPort,
     private readonly reportIngestor: AgentReportIngestorPort,
     private readonly updatePolicy: AgentUpdatePolicyPort
   ) {}
@@ -156,7 +150,6 @@ export class AgentUseCases {
     let ingested: { outcome: "completed" | "duplicate" | "conflict" };
     try {
       ingested = await this.reportIngestor.process(agent.id, report, {
-        payloadDigest: await this.reportDigest.digest(report),
         receivedAt,
         sourceLocation,
       });

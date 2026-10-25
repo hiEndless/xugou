@@ -1,7 +1,7 @@
 import { createDb } from "../../config/db";
 import type { Bindings } from "../../models/db";
 import { ApplicationProblem } from "../../shared/errors/ApplicationProblem";
-import { hmacSha256Hex, sha256Hex } from "../../utils/crypto";
+import { hmacSha256Hex } from "../../utils/crypto";
 import { shouldTriggerAgentUpdate } from "../../utils/agentConfig";
 import { AgentUseCases } from "./application/AgentUseCases";
 import { D1AgentReportIngestor } from "./persistence/D1AgentReportIngestor";
@@ -24,11 +24,6 @@ export function createAgentUseCases(env: Bindings) {
           );
         }
         return hmacSha256Hex(pepper, token);
-      },
-    },
-    {
-      digest(report) {
-        return sha256Hex(JSON.stringify(report));
       },
     },
     new D1AgentReportIngestor(env),

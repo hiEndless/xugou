@@ -40,7 +40,7 @@ func init() {
 	rootCmd.PersistentFlags().Int("live-interval", 12, "实时 WebSocket 攒批发送间隔（秒），只影响实时视图延迟，不影响采样精度")
 	rootCmd.PersistentFlags().String("spool-dir", "", "持久化采样队列目录（默认与配置文件同目录）")
 	rootCmd.PersistentFlags().Int64("spool-max-bytes", 64*1024*1024, "持久化采样队列大小上限（字节）")
-	rootCmd.PersistentFlags().Int("report-max-compressed-bytes", 64*1024, "单个 gzip 上报批次大小上限（字节）")
+	rootCmd.PersistentFlags().Int("report-max-compressed-bytes", 64*1024, "单个上报批次大小上限（字节）")
 	rootCmd.PersistentFlags().StringP("proxy", "p", "", "HTTP代理服务器地址（例如：http://proxy.example.com:8080）")
 
 	viper.BindPFlag("interval", rootCmd.PersistentFlags().Lookup("interval"))

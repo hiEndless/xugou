@@ -86,7 +86,7 @@ export interface AgentReportSample {
 }
 
 /**
- * 一个列式压缩的指标块。`data` 是 base64，解码规格见 ../metricblock。
+ * 列式压缩指标块：v5 使用 Base64，v6 使用二进制视图，编码规格不变。
  * 服务端按 (agent_id, resolution, bucket_start) 幂等 upsert。
  */
 export interface AgentReportBlock {
@@ -99,11 +99,46 @@ export interface AgentReportBlock {
    */
   point_count: number;
   codec: 1;
-  data: string;
+  data: string | Uint8Array;
+}
+
+export interface AgentMinuteSummary {
+  bucket_start: number;
+  point_count: number;
+  avg: AgentReportSample;
+}
+
+export interface AgentTrafficInterfaceSummary {
+  name: string;
+  first_ts: number;
+  last_ts: number;
+  first_rx: number;
+  first_tx: number;
+  last_rx: number;
+  last_tx: number;
+  delta_rx: number;
+  delta_tx: number;
+}
+
+export interface AgentTrafficSegment {
+  utc_day: string;
+  first_ts: number;
+  last_ts: number;
+  interfaces: AgentTrafficInterfaceSummary[];
+  last_speed: { rx: number | null; tx: number | null } | null;
+}
+
+export interface AgentReportSummary {
+  first_ts: number;
+  last_ts: number;
+  cpu_usage_peak: number | null;
+  memory_usage_peak: number | null;
+  disk_usage_peak: number | null;
+  traffic: AgentTrafficSegment[];
 }
 
 export interface AgentReportCommand {
-  protocol_version: 5;
+  protocol_version: 5 | 6;
   agent_version?: string;
   report_id: string;
   hostname?: string | null;
@@ -116,6 +151,8 @@ export interface AgentReportCommand {
   blocks: AgentReportBlock[];
   /** 本批次最后一条原始样本，用于更新 agent_current_metrics 与静态元数据。 */
   latest?: AgentReportSample;
+  summary?: AgentReportSummary;
+  minute_summaries?: AgentMinuteSummary[];
 }
 
 export interface AuthenticatedAgent {

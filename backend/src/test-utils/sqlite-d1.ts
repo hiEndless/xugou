@@ -116,7 +116,9 @@ CREATE TABLE agent_metric_blocks (
   point_count  INTEGER NOT NULL,
   codec        INTEGER NOT NULL,
   byte_size    INTEGER NOT NULL,
-  data         BLOB NOT NULL
+  data         BLOB NOT NULL,
+  summary_json TEXT,
+  public_json  TEXT
 );
 CREATE UNIQUE INDEX agent_metric_blocks_key_idx
   ON agent_metric_blocks (agent_id, resolution, bucket_start);

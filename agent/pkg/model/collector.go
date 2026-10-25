@@ -11,13 +11,13 @@ type DynamicMetrics struct {
 	Load           LoadInfo              `json:"load"`
 	Disks          []DiskInfo            `json:"disks,omitempty"`
 	Network        []NetworkInfo         `json:"network,omitempty"`
-	Swap           *SwapInfo             `json:"swap,omitempty"`            // Swap 信息（取不到时省略）
-	ProcessCount   int                   `json:"process_count,omitempty"`   // 进程数
-	TCPConnections int                   `json:"tcp_connections,omitempty"` // TCP 连接数
-	UDPConnections int                   `json:"udp_connections,omitempty"` // UDP 连接数
-	Ping           map[string]PingResult `json:"ping,omitempty"`            // 四线路 TCP 拨测结果（ct/cu/cm/bd）
-	IPv4Reachable  *bool                 `json:"ipv4_reachable,omitempty"`  // IPv4 出网可达性
-	IPv6Reachable  *bool                 `json:"ipv6_reachable,omitempty"`  // IPv6 出网可达性
+	Swap           *SwapInfo             `json:"swap,omitempty"`           // Swap 信息（取不到时省略）
+	ProcessCount   int                   `json:"process_count"`            // 进程数；0 是有效观测值
+	TCPConnections int                   `json:"tcp_connections"`          // TCP 连接数
+	UDPConnections int                   `json:"udp_connections"`          // UDP 连接数
+	Ping           map[string]PingResult `json:"ping,omitempty"`           // 四线路 TCP 拨测结果（ct/cu/cm/bd）
+	IPv4Reachable  *bool                 `json:"ipv4_reachable,omitempty"` // IPv4 出网可达性
+	IPv6Reachable  *bool                 `json:"ipv6_reachable,omitempty"` // IPv6 出网可达性
 }
 
 // SystemInfo 包含系统的各种信息
@@ -59,8 +59,8 @@ type AgentReportSample struct {
 }
 
 // AgentReportProtocolVersion 是当前数据面协议版本。
-// v4 以逐条 JSON 样本上报，v5 改为列式压缩块，两者不兼容。
-const AgentReportProtocolVersion = 5
+// v6 保留 v5 指标块编码，在线路上直接传二进制，并附带分钟与流量摘要。
+const AgentReportProtocolVersion = 6
 
 // AgentReportBlock 是一个列式压缩的指标块。编码规格见 pkg/metricblock，
 // 服务端按 (agent_id, resolution, bucket_start) 幂等 upsert。
@@ -72,10 +72,12 @@ type AgentReportBlock struct {
 	// 与块头里恒为 60 的 slot_count 不是一回事。
 	PointCount int    `json:"point_count"`
 	Codec      int    `json:"codec"`
-	Data       string `json:"data"` // base64 (std, 带 padding)
+	Data       string `json:"data,omitempty"` // 仅本地持久化使用 base64
+	ByteLength int    `json:"byte_length,omitempty"`
+	RawData    []byte `json:"-"`
 }
 
-// AgentReport 是 v5 数据面持久化和传输的稳定信封。report_id 在本地 Spool
+// AgentReport 是数据面持久化的稳定信封。report_id 在本地 Spool
 // 首次组批时生成，网络重试和进程重启后保持不变。
 type AgentReport struct {
 	ProtocolVersion       int                 `json:"protocol_version"`
@@ -91,7 +93,53 @@ type AgentReport struct {
 	Blocks                []*AgentReportBlock `json:"blocks"`
 	// Latest 是本批次最后一条原始样本，服务端据此更新 agent_current_metrics
 	// 以及 CPU 型号、设备名等不进块的静态元数据。
-	Latest *AgentReportSample `json:"latest,omitempty"`
+	Latest          *AgentReportSample          `json:"latest,omitempty"`
+	MinuteSummaries []*AgentReportMinuteSummary `json:"minute_summaries,omitempty"`
+	Summary         *AgentReportSummary         `json:"summary,omitempty"`
+}
+
+// AgentReportMinuteSummary 让服务端直接保存新增分钟，无需解压原始秒级块。
+type AgentReportMinuteSummary struct {
+	BucketStart int64              `json:"bucket_start"`
+	PointCount  int                `json:"point_count"`
+	Avg         *AgentReportSample `json:"avg"`
+}
+
+// AgentReportSummary 保留整个批次的峰值与逐网卡流量，不能以最新样本替代。
+type AgentReportSummary struct {
+	FirstTS         int64                        `json:"first_ts"`
+	LastTS          int64                        `json:"last_ts"`
+	CPUUsagePeak    *float64                     `json:"cpu_usage_peak"`
+	MemoryUsagePeak *float64                     `json:"memory_usage_peak"`
+	DiskUsagePeak   *float64                     `json:"disk_usage_peak"`
+	Traffic         []*AgentReportTrafficSegment `json:"traffic"`
+}
+
+// AgentReportTrafficSegment 按 UTC 日拆段，使后端可按自定义月重置日结算。
+// FirstTS/LastTS 是该日样本边界；每块网卡还保留自己的实际出现时间。
+type AgentReportTrafficSegment struct {
+	UTCDay     string                         `json:"utc_day"`
+	FirstTS    int64                          `json:"first_ts"`
+	LastTS     int64                          `json:"last_ts"`
+	Interfaces []*AgentReportTrafficInterface `json:"interfaces"`
+	LastSpeed  *AgentReportTrafficSpeed       `json:"last_speed"`
+}
+
+type AgentReportTrafficInterface struct {
+	Name    string `json:"name"`
+	FirstTS int64  `json:"first_ts"`
+	LastTS  int64  `json:"last_ts"`
+	FirstRx uint64 `json:"first_rx"`
+	FirstTx uint64 `json:"first_tx"`
+	LastRx  uint64 `json:"last_rx"`
+	LastTx  uint64 `json:"last_tx"`
+	DeltaRx uint64 `json:"delta_rx"`
+	DeltaTx uint64 `json:"delta_tx"`
+}
+
+type AgentReportTrafficSpeed struct {
+	Rx *float64 `json:"rx"`
+	Tx *float64 `json:"tx"`
 }
 
 // SampleCount 汇总本次上报覆盖的采样点数，仅用于日志。
@@ -109,21 +157,21 @@ func (r *AgentReport) SampleCount() int {
 // Credential 和静态身份；身份在 WebSocket 握手阶段通过 Authorization Header
 // 完成绑定。
 type LiveMetricSample struct {
-	CollectedAt     string                `json:"collected_at"`
-	CPU             CPUInfo               `json:"cpu"`
-	Memory          MemoryInfo            `json:"memory"`
-	Load            LoadInfo              `json:"load"`
-	Disks           []DiskInfo            `json:"disks,omitempty"`
-	Network         []NetworkInfo         `json:"network,omitempty"`
-	Swap            *SwapInfo             `json:"swap,omitempty"`
-	ProcessCount    int                   `json:"process_count,omitempty"`
-	TCPConnections  int                   `json:"tcp_connections,omitempty"`
-	UDPConnections  int                   `json:"udp_connections,omitempty"`
-	Ping            map[string]PingResult `json:"ping,omitempty"`
-	IPv4Reachable   *bool                 `json:"ipv4_reachable,omitempty"`
-	IPv6Reachable   *bool                 `json:"ipv6_reachable,omitempty"`
-	NetworkRxSpeed  *float64              `json:"network_rx_speed"`
-	NetworkTxSpeed  *float64              `json:"network_tx_speed"`
+	CollectedAt    string                `json:"collected_at"`
+	CPU            CPUInfo               `json:"cpu"`
+	Memory         MemoryInfo            `json:"memory"`
+	Load           LoadInfo              `json:"load"`
+	Disks          []DiskInfo            `json:"disks,omitempty"`
+	Network        []NetworkInfo         `json:"network,omitempty"`
+	Swap           *SwapInfo             `json:"swap,omitempty"`
+	ProcessCount   int                   `json:"process_count,omitempty"`
+	TCPConnections int                   `json:"tcp_connections,omitempty"`
+	UDPConnections int                   `json:"udp_connections,omitempty"`
+	Ping           map[string]PingResult `json:"ping,omitempty"`
+	IPv4Reachable  *bool                 `json:"ipv4_reachable,omitempty"`
+	IPv6Reachable  *bool                 `json:"ipv6_reachable,omitempty"`
+	NetworkRxSpeed *float64              `json:"network_rx_speed"`
+	NetworkTxSpeed *float64              `json:"network_tx_speed"`
 }
 
 // LiveMetricBatch 是 Agent 到 Worker 独立上行 WebSocket 的实时协议（v2）。

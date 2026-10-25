@@ -13,14 +13,22 @@ import {
   base64ByteLength,
   base64ToBytes,
   decodeBlock,
+  inspectBlock,
   MetricBlockError,
 } from "./decode";
 import {
   CODEC_VERSION,
+  ENCODING_DELTA,
+  ENCODING_DELTA_OF_DELTA,
+  ENCODING_RAW,
+  FLAG_PRESENCE,
   HEADER_SIZE,
+  MAGIC,
   PING_FIELD_LATENCY_MS,
   PING_FIELD_LOSS,
   SERIES_CPU_USAGE,
+  SERIES_MEMORY_USED,
+  SERIES_PROCESS_COUNT,
   pingSeriesId,
 } from "./registry";
 
@@ -65,6 +73,71 @@ function bytesOf(base64: string): Uint8Array {
   return Uint8Array.from(Buffer.from(base64, "base64"));
 }
 
+interface TestSeries {
+  id: number;
+  encoding: number;
+  values: (bigint | null)[][];
+}
+
+/** 未压缩的独立测试块，覆盖 Go fixture 中没有出现的整数边界和不同 presence。 */
+function integerBlock(
+  series: TestSeries[],
+  options: { slotCount?: number; aggregateCount?: number; presence?: boolean } = {}
+): Uint8Array {
+  const slotCount = options.slotCount ?? series[0]?.values[0].length ?? 1;
+  const aggregateCount = options.aggregateCount ?? series[0]?.values.length ?? 1;
+  const presence = options.presence ?? true;
+  const header = new Uint8Array(HEADER_SIZE + 3 + series.length * 4);
+  header[0] = MAGIC;
+  header[1] = CODEC_VERSION;
+  header[2] = 1;
+  header[3] = presence ? FLAG_PRESENCE : 0;
+  header[4] = aggregateCount;
+  const view = new DataView(header.buffer);
+  view.setUint16(6, series.length, true);
+  view.setUint16(8, slotCount, true);
+  const payload: number[] = [];
+  const appendSigned = (value: bigint) => {
+    let encoded = value < 0n ? (-value << 1n) - 1n : value << 1n;
+    while (encoded >= 128n) {
+      payload.push(Number(encoded & 0x7fn) | 0x80);
+      encoded >>= 7n;
+    }
+    payload.push(Number(encoded));
+  };
+  series.forEach((column, index) => {
+    const descriptorOffset = HEADER_SIZE + 3 + index * 4;
+    view.setUint16(descriptorOffset, column.id, true);
+    header[descriptorOffset + 2] = column.encoding;
+    for (const values of column.values) {
+      if (presence) {
+        const bitmap = new Uint8Array(Math.ceil(slotCount / 8));
+        values.forEach((value, slot) => {
+          if (value !== null) bitmap[slot >> 3] |= 1 << (slot & 7);
+        });
+        payload.push(...bitmap);
+      }
+      let previous = 0n;
+      let previousDelta = 0n;
+      let count = 0;
+      for (const value of values) {
+        if (value === null) continue;
+        const delta = value - previous;
+        const encoded = column.encoding === ENCODING_RAW || count === 0
+          ? value
+          : column.encoding === ENCODING_DELTA_OF_DELTA && count > 1
+            ? delta - previousDelta
+            : delta;
+        appendSigned(encoded);
+        previous = value;
+        previousDelta = delta;
+        count++;
+      }
+    }
+  });
+  return Uint8Array.from([...header, ...payload]);
+}
+
 describe("跨语言往返", () => {
   it("fixture 的 codec 版本与本端一致", () => {
     expect(fixtures.codecVersion).toBe(CODEC_VERSION);
@@ -87,6 +160,7 @@ describe("跨语言往返", () => {
         expect(block.interval).toBe(testCase.expect.interval);
         expect(block.bucketStart).toBe(testCase.expect.bucketStart);
         expect(block.slotCount).toBe(testCase.expect.slotCount);
+        expect(block.actualPointCount).toBe(testCase.pointCount);
         expect(block.aggregateCount).toBe(testCase.expect.aggregateCount);
         expect(block.memoryTotal).toBe(testCase.expect.memoryTotal);
         expect(block.swapTotal).toBe(testCase.expect.swapTotal);
@@ -177,6 +251,115 @@ describe("跨语言往返", () => {
       expect(min[slot]!).toBeLessThanOrEqual(avg[slot]!);
       expect(avg[slot]!).toBeLessThanOrEqual(max[slot]!);
     }
+  });
+});
+
+describe("结构检查与实际点数", () => {
+  it("inspectBlock 与完整解码共用块头，但不解压载荷", async () => {
+    const corrupt = bytesOf(fixtures.cases[0].data);
+    corrupt[corrupt.length - 1] ^= 0xff;
+    const inspected = inspectBlock(corrupt);
+    expect(inspected).toMatchObject({
+      codec: CODEC_VERSION,
+      interval: 1,
+      slotCount: 60,
+      aggregateCount: 1,
+      seriesCount: 35,
+    });
+    expect(inspected.payloadOffset).toBeLessThan(corrupt.length);
+    expect(inspected.descriptors).toHaveLength(inspected.seriesCount);
+    await expect(decodeBlock(corrupt)).rejects.toThrow(MetricBlockError);
+  });
+
+  it("inspectBlock 拒绝越界维度、截断描述符和非法序列", () => {
+    const valid = integerBlock([
+      { id: SERIES_CPU_USAGE, encoding: ENCODING_RAW, values: [[0n]] },
+    ]);
+    const badDims = valid.slice();
+    badDims[HEADER_SIZE] = 1;
+    badDims[HEADER_SIZE + 1] = 255;
+    expect(() => inspectBlock(badDims)).toThrow(MetricBlockError);
+    const payloadOffset = inspectBlock(valid).payloadOffset;
+    expect(() => inspectBlock(valid.subarray(0, payloadOffset - 1)))
+      .toThrow(MetricBlockError);
+    const badSeries = valid.slice();
+    new DataView(badSeries.buffer).setUint16(HEADER_SIZE + 3, 0xffff, true);
+    expect(() => inspectBlock(badSeries)).toThrow(MetricBlockError);
+  });
+
+  it("点数取聚合位 0 的 presence 并集，零值存在且其他聚合位不计入", async () => {
+    const cpu = [0n, null, null, null, null, null, null, null, null, null];
+    const memory = [null, null, null, null, null, null, null, null, null, 5n];
+    const minimum = [null, 1n, null, null, null, null, null, null, null, null];
+    const maximum = [null, null, 9n, null, null, null, null, null, null, null];
+    const block = await decodeBlock(integerBlock([
+      { id: SERIES_CPU_USAGE, encoding: ENCODING_RAW, values: [cpu, minimum, maximum] },
+      { id: SERIES_MEMORY_USED, encoding: ENCODING_RAW, values: [memory, minimum, maximum] },
+    ]));
+    expect(block.actualPointCount).toBe(2);
+    expect(block.series.get(SERIES_CPU_USAGE)?.[0][0]).toBe(0);
+  });
+
+  it("忽略 presence 最后一个字节中超出 slot_count 的填充位", async () => {
+    const raw = integerBlock([
+      { id: SERIES_CPU_USAGE, encoding: ENCODING_RAW, values: [[null, null, null]] },
+    ]);
+    raw[inspectBlock(raw).payloadOffset] = 0xf8;
+    expect((await decodeBlock(raw)).actualPointCount).toBe(0);
+  });
+
+  it("没有 presence 时仅有序列的块才计为稠密", async () => {
+    const dense = integerBlock([
+      { id: SERIES_CPU_USAGE, encoding: ENCODING_RAW, values: [[0n, 0n, 0n]] },
+    ], { presence: false });
+    expect((await decodeBlock(dense)).actualPointCount).toBe(3);
+    const empty = integerBlock([], { slotCount: 3, presence: false });
+    expect((await decodeBlock(empty)).actualPointCount).toBe(0);
+  });
+});
+
+describe("整数快路径与 64 位回退", () => {
+  for (const encoding of [ENCODING_DELTA, ENCODING_DELTA_OF_DELTA]) {
+    it(`编码 ${encoding} 保留超过 2^53 的计数器逐点累积`, async () => {
+      const start = 2n ** 53n;
+      const values = Array.from({ length: 8 }, (_, index) => start + BigInt(index));
+      const block = await decodeBlock(integerBlock([
+        { id: SERIES_PROCESS_COUNT, encoding, values: [values] },
+      ]));
+      expect(block.series.get(SERIES_PROCESS_COUNT)?.[0]).toEqual(values.map(Number));
+    });
+
+    it(`编码 ${encoding} 在小 varint 累计越界时转用精确整数`, async () => {
+      const step = 2n ** 48n - 1n;
+      const values = Array.from({ length: 40 }, (_, index) =>
+        encoding === ENCODING_DELTA
+          ? step * BigInt(index)
+          : step * BigInt(index) * BigInt(index + 1) / 2n
+      );
+      const block = await decodeBlock(integerBlock([
+        { id: SERIES_PROCESS_COUNT, encoding, values: [values] },
+      ]));
+      expect(block.series.get(SERIES_PROCESS_COUNT)?.[0]).toEqual(values.map(Number));
+    });
+  }
+
+  it("raw 编码支持 int64 正负边界与负数 zigzag", async () => {
+    const values = [2n ** 63n - 1n, -(2n ** 63n), -1n, 0n, 1n];
+    const block = await decodeBlock(integerBlock([
+      { id: SERIES_PROCESS_COUNT, encoding: ENCODING_RAW, values: [values] },
+    ]));
+    expect(block.series.get(SERIES_PROCESS_COUNT)?.[0]).toEqual(values.map(Number));
+  });
+
+  it("拒绝第十字节超过 uint64 范围的 varint", async () => {
+    const valid = integerBlock([
+      { id: SERIES_PROCESS_COUNT, encoding: ENCODING_RAW, values: [[0n]] },
+    ]);
+    const offset = inspectBlock(valid).payloadOffset;
+    const overflow = Uint8Array.from([
+      ...valid.subarray(0, offset + 1), ...new Array<number>(9).fill(0x80), 2,
+    ]);
+    await expect(decodeBlock(overflow)).rejects.toThrow("varint 超出 64 位");
   });
 });
 

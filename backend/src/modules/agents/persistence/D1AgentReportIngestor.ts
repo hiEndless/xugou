@@ -7,6 +7,9 @@ import {
   parseTrafficBaselines,
 } from "../../../utils/traffic";
 import type { AgentReportCommand } from "../domain/models";
+import { computeSummarizedTraffic } from "../../../utils/traffic-summary";
+import { preparePublicMinuteProjection } from "../metricblock/public-projection";
+import { preserveReplacedHours } from "../metricblock/archive-compat";
 import { publishLatestMetrics } from "../realtime/MetricsBroadcastPublisher";
 import {
   normalizeAgentCountry,
@@ -15,9 +18,9 @@ import {
 } from "../../../utils/geo";
 import { requestStatusRebuild } from "../../status/persistence/status-events";
 import {
-  base64ByteLength,
   base64ToBytes,
-  decodeBlockBase64,
+  decodeBlock,
+  inspectBlock,
   MetricBlockError,
   type DecodedBlock,
 } from "../metricblock/decode";
@@ -168,6 +171,68 @@ function currentThresholdState(
 export class D1AgentReportIngestor {
   constructor(private readonly env: Bindings) {}
 
+  private validateSummary(
+    report: AgentReportCommand,
+    blocks: Array<{ block: AgentReportCommand["blocks"][number]; raw: Uint8Array }>
+  ) {
+    const summary = report.summary;
+    const minutes = report.minute_summaries;
+    if (!summary || !minutes?.length || !report.latest) {
+      throw new AgentBlockRejected("v6 上报必须包含分钟摘要、窗口摘要和最新快照");
+    }
+    const hot = new Map<number, number>();
+    for (const { block, raw } of blocks) {
+      try {
+        const header = inspectBlock(raw);
+        if (header.interval !== block.resolution || header.bucketStart !== block.bucket_start ||
+            header.slotCount !== 60 || header.aggregateCount !== (block.resolution === 1 ? 1 : 3) ||
+            block.bucket_start % (block.resolution * 60) !== 0) {
+          throw new Error("块头与信封不一致");
+        }
+      } catch (error) {
+        throw new AgentBlockRejected(error instanceof Error ? error.message : String(error));
+      }
+      if (block.resolution === 1) {
+        if (hot.has(block.bucket_start)) throw new AgentBlockRejected("分钟块不能重复");
+        hot.set(block.bucket_start, block.point_count);
+      }
+    }
+    if (hot.size !== minutes.length) throw new AgentBlockRejected("分钟摘要与原始块不匹配");
+    const seen = new Set<number>();
+    for (const minute of minutes) {
+      if (seen.has(minute.bucket_start) || hot.get(minute.bucket_start) !== minute.point_count ||
+          Date.parse(minute.avg.collected_at) !== minute.bucket_start * 1000) {
+        throw new AgentBlockRejected("分钟摘要的时间、点数或唯一性不正确");
+      }
+      seen.add(minute.bucket_start);
+    }
+    const firstBucket = Math.min(...hot.keys()) * 1000;
+    const lastBucketEnd = (Math.max(...hot.keys()) + 60) * 1000;
+    if (summary.first_ts < firstBucket || summary.last_ts >= lastBucketEnd ||
+        summary.first_ts > summary.last_ts || Date.parse(report.latest.collected_at) !== summary.last_ts) {
+      throw new AgentBlockRejected("窗口摘要或最新快照的时间不正确");
+    }
+    let previousEnd = -1;
+    for (const segment of summary.traffic) {
+      const firstDay = new Date(segment.first_ts).toISOString().slice(0, 10);
+      const lastDay = new Date(segment.last_ts).toISOString().slice(0, 10);
+      if (segment.first_ts < summary.first_ts || segment.last_ts > summary.last_ts ||
+          segment.first_ts > segment.last_ts || segment.first_ts <= previousEnd ||
+          segment.utc_day !== firstDay || segment.utc_day !== lastDay) {
+        throw new AgentBlockRejected("流量摘要必须按 UTC 日和采集时间分段");
+      }
+      previousEnd = segment.last_ts;
+      const names = new Set<string>();
+      for (const item of segment.interfaces) {
+        if (names.has(item.name) || item.first_ts < segment.first_ts || item.last_ts > segment.last_ts ||
+            item.first_ts > item.last_ts) {
+          throw new AgentBlockRejected("网卡摘要的时间或唯一性不正确");
+        }
+        names.add(item.name);
+      }
+    }
+  }
+
   /**
    * 解码并校验上报体里的全部块。
    *
@@ -175,12 +240,12 @@ export class D1AgentReportIngestor {
    * 以及确认信封里的 resolution/bucket_start/point_count 与块头自述一致 ——
    * 不一致说明客户端有 bug 或在伪造，这类请求不该污染存储。
    */
-  private async decodeBlocks(report: AgentReportCommand) {
+  private async decodeBlocks(blocks: Array<{ block: AgentReportCommand["blocks"][number]; raw: Uint8Array }>) {
     const decoded: Array<{ resolution: number; block: DecodedBlock }> = [];
-    for (const block of report.blocks) {
+    for (const { block, raw } of blocks) {
       let parsed: DecodedBlock;
       try {
-        parsed = await decodeBlockBase64(block.data);
+        parsed = await decodeBlock(raw);
       } catch (error) {
         const detail =
           error instanceof MetricBlockError ? error.message : String(error);
@@ -198,7 +263,7 @@ export class D1AgentReportIngestor {
           `块头 bucket_start=${parsed.bucketStart} 与信封 ${block.bucket_start} 不一致`
         );
       }
-      const actualPoints = blockSamples(parsed).length;
+      const actualPoints = parsed.actualPointCount;
       if (actualPoints !== block.point_count) {
         throw new AgentBlockRejected(
           `块内实际点数 ${actualPoints} 与信封 point_count=${block.point_count} 不一致`
@@ -230,7 +295,6 @@ export class D1AgentReportIngestor {
     agentId: number,
     report: AgentReportCommand,
     input: {
-      payloadDigest: string;
       receivedAt: string;
       sourceLocation?: AgentReportSourceLocation;
     }
@@ -243,10 +307,20 @@ export class D1AgentReportIngestor {
     // (agent_id, resolution, bucket_start) upsert，重传天然幂等，
     // 更短的块还会被单调守卫挡住。
     //
-    // 解码放在写库之前：坏块直接拒收而不是先落库再发现，
-    // 摄入路径顺带承担了块合法性校验。
-    const decodedBlocks = await this.decodeBlocks(report);
-    const samples = materializeHotSamples(decodedBlocks);
+    // 写库前校验：v5 完整解码，v6 检查块结构与摘要对应关系，
+    // 原始字节只准备一次，后续绑定和兼容解码复用同一份数据。
+    const blocks = report.blocks.map((block) => ({
+      block,
+      raw: typeof block.data === "string" ? base64ToBytes(block.data) : block.data,
+    }));
+    const summaries = report.minute_summaries ?? [];
+    const minuteJson = new Map(summaries.map(summary => [summary.bucket_start, JSON.stringify(summary.avg)]));
+    if (report.protocol_version === 6) {
+      this.validateSummary(report, blocks);
+    }
+    const preservedHours = report.protocol_version === 6
+      ? await preserveReplacedHours(this.env, agentId, blocks)
+      : new Map<number, { summaryJson: string; publicJson: string | null }>();
 
     const [agentState, storedTraffic, thresholdSetting] = await Promise.all([
       this.env.DB.prepare(
@@ -279,6 +353,14 @@ export class D1AgentReportIngestor {
       throw new Error(`Agent ${agentId} is missing or deleted`);
     }
 
+    // 旧探针仍完整验证。v6 通常仅校验块头和小摘要；升级跨越半个旧批次时
+    // 回退一次完整解码，避免摘要里的内部增量覆盖已经记账过的秒级样本。
+    const previousTs = storedTraffic?.collected_at ? Date.parse(storedTraffic.collected_at) : null;
+    const overlaps = report.summary && previousTs !== null &&
+      previousTs >= report.summary.first_ts && previousTs < report.summary.last_ts;
+    const useSummary = report.protocol_version === 6 && report.summary && !overlaps;
+    const samples = useSummary ? [] : materializeHotSamples(await this.decodeBlocks(blocks));
+
     const sourceRegion = normalizeAgentCountry(input.sourceLocation?.country);
     const sourceGeo = normalizeAgentGeo(input.sourceLocation);
     const locationChanged =
@@ -289,16 +371,15 @@ export class D1AgentReportIngestor {
       (sourceGeo.region_name !== null &&
         sourceGeo.region_name !== agentState.geo_region_name);
 
-    // 派生指标全部来自解块后的样本序列：块里是完整的 1 秒精度数据，
-    // 比只看 report.latest 更准（月流量靠计数器差分累加，阈值取窗口内峰值）。
+    // v6 使用探针按完整采样窗口计算的摘要，旧协议从秒级样本推导：
+    // 月流量按计数器差分累加，阈值取窗口内峰值，均不能只看 latest。
     const lastSample = samples.length > 0 ? samples[samples.length - 1] : null;
-    const latestCollectedAtMs = lastSample
+    const latestCollectedAtMs = useSummary ? report.summary!.last_ts : lastSample
       ? lastSample.timestampMs
       : Date.parse(report.latest?.collected_at ?? nowIso);
     const latestCollectedAtIso = new Date(latestCollectedAtMs).toISOString();
 
-    const traffic = computeTraffic(
-      storedTraffic
+    const previousTraffic = storedTraffic
         ? {
             month_rx: Number(storedTraffic.month_rx ?? 0),
             month_tx: Number(storedTraffic.month_tx ?? 0),
@@ -310,7 +391,13 @@ export class D1AgentReportIngestor {
               ? Date.parse(storedTraffic.collected_at)
               : null,
           }
-        : null,
+        : null;
+    const traffic = useSummary ? computeSummarizedTraffic(
+      previousTraffic,
+      report.summary!.traffic,
+      normalizeTrafficResetDay(agentState.traffic_reset_day)
+    ) : computeTraffic(
+      previousTraffic,
       // 逐网卡喂给累计器：接口名必须带上，否则无法分辨「某块网卡计数器归零」
       // 和「某块网卡从统计里消失」——后者按总和差分会凭空多记一整个总量。
       samples.map((sample) => ({
@@ -332,7 +419,11 @@ export class D1AgentReportIngestor {
         ? traffic.speeds[traffic.speeds.length - 1]
         : undefined;
 
-    const observedMetrics = {
+    const observedMetrics = useSummary ? {
+      cpu: report.summary!.cpu_usage_peak,
+      memory: report.summary!.memory_usage_peak,
+      disk: report.summary!.disk_usage_peak,
+    } : {
       cpu: maxOf(samples, (sample) => sample.cpuUsage),
       memory: maxOf(samples, (sample) => sample.memoryUsageRate),
       disk: maxOf(samples, maxDiskUsageRate),
@@ -397,28 +488,52 @@ export class D1AgentReportIngestor {
     const metricsObservedEventId = `agent.metrics.observed:${report.report_id}`;
 
     const statements: D1PreparedStatement[] = [
-      // 块 upsert：幂等（重传同一块结果一致）且单调（更短的块不覆盖更完整的）。
-      // 这两条性质替代了 v4 的 agent_reports 去重表与状态机。
-      ...report.blocks.map((block) =>
-        this.env.DB.prepare(
+      // 秒级块保持点数单调；v6 小时替换已保留未覆盖的旧分钟，允许升级中途封存。
+      ...blocks.map(({ block, raw }) => {
+        const preserved = block.resolution === 60 ? preservedHours.get(block.bucket_start) : undefined;
+        const summaryJson = block.resolution === 1
+          ? minuteJson.get(block.bucket_start) ?? null
+          : report.protocol_version === 6 ? preserved?.summaryJson ?? '{"sealed":true}' : null;
+        return this.env.DB.prepare(
           `INSERT INTO agent_metric_blocks
-           (agent_id, resolution, bucket_start, point_count, codec, byte_size, data)
-           VALUES (?, ?, ?, ?, ?, ?, ?)
+           (agent_id, resolution, bucket_start, point_count, codec, byte_size, data, summary_json, public_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(agent_id, resolution, bucket_start) DO UPDATE SET
              point_count = excluded.point_count,
-             byte_size   = excluded.byte_size,
-             data        = excluded.data
-           WHERE excluded.point_count >= agent_metric_blocks.point_count`
+             byte_size   = excluded.byte_size + CASE
+               WHEN excluded.resolution = 1 AND excluded.summary_json IS NULL
+               THEN COALESCE(length(CAST(agent_metric_blocks.summary_json AS BLOB)), 0)
+               ELSE 0 END,
+             data        = excluded.data,
+             summary_json = CASE WHEN excluded.resolution = 60 THEN excluded.summary_json
+               ELSE COALESCE(excluded.summary_json, agent_metric_blocks.summary_json) END,
+             public_json = CASE WHEN ? = 5 AND excluded.resolution = 60
+               AND excluded.data != agent_metric_blocks.data THEN NULL
+               WHEN excluded.public_json IS NOT NULL THEN json_set(
+                 COALESCE(agent_metric_blocks.public_json, '{"v":1,"r":0,"p":{}}'),
+                 '$.p', json_patch(json_extract(excluded.public_json, '$.p'),
+                   COALESCE(json_extract(agent_metric_blocks.public_json, '$.p'), '{}')),
+                 '$.r', COALESCE(json_extract(agent_metric_blocks.public_json, '$.r'), 0) + 1)
+               ELSE agent_metric_blocks.public_json END
+           WHERE (? = 6 AND excluded.resolution = 60)
+              OR excluded.point_count >= agent_metric_blocks.point_count`
         ).bind(
           agentId,
           block.resolution,
           block.bucket_start,
           block.point_count,
           block.codec,
-          base64ByteLength(block.data),
-          base64ToBytes(block.data)
-        )
-      ),
+          raw.byteLength + (summaryJson ? new TextEncoder().encode(summaryJson).byteLength : 0),
+          raw,
+          summaryJson,
+          preserved?.publicJson ?? null,
+          report.protocol_version,
+          report.protocol_version
+        );
+      }),
+      ...summaries.map((summary) => preparePublicMinuteProjection(
+        this.env.DB, agentId, summary.avg, summary.point_count
+      )),
       this.env.DB.prepare(
         `UPDATE agent_runtime SET
            status = 'active', hostname = COALESCE(?, hostname),

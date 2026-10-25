@@ -43,12 +43,36 @@ export interface DecodedBlock {
   bucketStart: number;
   /** 时间槽总数，恒为 60。与上报体里"实际存在点数"的 point_count 不同。 */
   slotCount: number;
+  /** 聚合位 0 中至少有一个序列存在的槽数，不需要还原样本对象即可校验 point_count。 */
+  actualPointCount: number;
   aggregateCount: number;
   dims: BlockDims;
   memoryTotal: number;
   swapTotal: number;
   /** series_id -> [agg][slot]，null 表示该槽缺值。 */
   series: Map<number, (number | null)[][]>;
+}
+
+export interface BlockSeriesDescriptor {
+  id: number;
+  encoding: number;
+  scale: number;
+}
+
+/** 可在归档写入时检查的自描述结构；不代表压缩载荷或数值序列已经通过校验。 */
+export interface InspectedBlock {
+  codec: number;
+  interval: number;
+  bucketStart: number;
+  slotCount: number;
+  aggregateCount: number;
+  seriesCount: number;
+  flags: number;
+  memoryTotal: number;
+  swapTotal: number;
+  dims: BlockDims;
+  descriptors: BlockSeriesDescriptor[];
+  payloadOffset: number;
 }
 
 /** base64 解成字节。非法输入抛 MetricBlockError 而不是 atob 的原生异常。 */
@@ -85,21 +109,46 @@ export async function decodeBlockBase64(value: string): Promise<DecodedBlock> {
   return decodeBlock(base64ToBytes(value));
 }
 
-function readVarint(buf: Uint8Array, offset: number): [bigint, number] {
-  let result = 0n;
-  let shift = 0n;
-  for (;;) {
+function readVarint(buf: Uint8Array, offset: number): [number | bigint, number] {
+  // 七个字节最多承载 49 位，乘加始终精确。常见数值与小 delta 无需创建 BigInt。
+  let result = 0;
+  let factor = 1;
+  for (let index = 0; index < 7; index++) {
     if (offset >= buf.length) throw new MetricBlockError("varint 被截断");
-    if (shift > 63n) throw new MetricBlockError("varint 超出 64 位");
     const byte = buf[offset++];
-    result |= BigInt(byte & 0x7f) << shift;
+    result += (byte & 0x7f) * factor;
     if ((byte & 0x80) === 0) return [result, offset];
-    shift += 7n;
+    factor *= 128;
   }
+
+  let largeResult = BigInt(result);
+  for (let shift = 49n; shift <= 63n; shift += 7n) {
+    if (offset >= buf.length) throw new MetricBlockError("varint 被截断");
+    const byte = buf[offset++];
+    if (shift === 63n && byte > 1) {
+      throw new MetricBlockError("varint 超出 64 位");
+    }
+    largeResult |= BigInt(byte & 0x7f) << shift;
+    if ((byte & 0x80) === 0) return [largeResult, offset];
+  }
+  throw new MetricBlockError("varint 超出 64 位");
 }
 
-function unzigzag(v: bigint): bigint {
-  return (v >> 1n) ^ -(v & 1n);
+function unzigzagNumber(value: number): number {
+  // 位运算会把 Number 截成 32 位，这里的 varint 可达 49 位。
+  return value % 2 === 0 ? value / 2 : -(value + 1) / 2;
+}
+
+function countOccupiedSlots(bitmap: Uint8Array, slotCount: number): number {
+  let count = 0;
+  for (let index = 0; index < bitmap.length; index++) {
+    const remaining = slotCount - index * 8;
+    let bits = bitmap[index] & (remaining < 8 ? (1 << remaining) - 1 : 0xff);
+    bits -= (bits >>> 1) & 0x55;
+    bits = (bits & 0x33) + ((bits >>> 2) & 0x33);
+    count += (bits + (bits >>> 4)) & 0x0f;
+  }
+  return count;
 }
 
 function bitmapLen(n: number): number {
@@ -200,10 +249,8 @@ function decodeDimHeader(
   return { dims: { disks, nets, pings }, offset };
 }
 
-/**
- * 解析一个指标块。任何不满足规格的输入都抛 MetricBlockError。
- */
-export async function decodeBlock(raw: Uint8Array): Promise<DecodedBlock> {
+/** 检查块头、维度与描述符边界，不解压或遍历数值载荷。完整数值校验使用 decodeBlock。 */
+export function inspectBlock(raw: Uint8Array): InspectedBlock {
   if (raw.length < HEADER_SIZE) {
     throw new MetricBlockError(`长度 ${raw.length} 不足以容纳块头`);
   }
@@ -242,7 +289,7 @@ export async function decodeBlock(raw: Uint8Array): Promise<DecodedBlock> {
   if (offset + seriesCount * 4 > raw.length) {
     throw new MetricBlockError("描述符区被截断");
   }
-  const descriptors: { id: number; encoding: number; scale: number }[] = [];
+  const descriptors: BlockSeriesDescriptor[] = [];
   let prevId = -1;
   for (let i = 0; i < seriesCount; i++) {
     const id = view.getUint16(offset, true);
@@ -262,12 +309,35 @@ export async function decodeBlock(raw: Uint8Array): Promise<DecodedBlock> {
     descriptors.push({ id, encoding, scale });
   }
 
-  let payload = raw.subarray(offset);
+  return {
+    codec: raw[1],
+    interval,
+    bucketStart,
+    slotCount,
+    aggregateCount,
+    seriesCount,
+    flags,
+    memoryTotal,
+    swapTotal,
+    dims,
+    descriptors,
+    payloadOffset: offset,
+  };
+}
+
+/** 解析一个指标块，包含压缩载荷与全部数值序列的校验。 */
+export async function decodeBlock(raw: Uint8Array): Promise<DecodedBlock> {
+  const {
+    interval, bucketStart, slotCount, aggregateCount, seriesCount,
+    flags, memoryTotal, swapTotal, dims, descriptors, payloadOffset,
+  } = inspectBlock(raw);
+  let payload = raw.subarray(payloadOffset);
   if ((flags & FLAG_GZIP) !== 0) {
     payload = await gunzip(payload);
   }
 
   const hasPresence = (flags & FLAG_PRESENCE) !== 0;
+  const occupiedSlots = hasPresence ? new Uint8Array(bitmapLen(slotCount)) : null;
   const series = new Map<number, (number | null)[][]>();
   let pos = 0;
 
@@ -283,17 +353,51 @@ export async function decodeBlock(raw: Uint8Array): Promise<DecodedBlock> {
         }
         present = payload.subarray(pos, pos + n);
         pos += n;
+        if (agg === 0 && occupiedSlots) {
+          for (let index = 0; index < n; index++) {
+            occupiedSlots[index] |= present[index];
+          }
+        }
       }
 
       const values: (number | null)[] = new Array(slotCount).fill(null);
-      let prev = 0n;
-      let prevDelta = 0n;
+      let prev: number | bigint = 0;
+      let prevDelta: number | bigint = 0;
       let count = 0;
       for (let slot = 0; slot < slotCount; slot++) {
         if (present !== null && !getBit(present, slot)) continue;
         const [rawVal, next] = readVarint(payload, pos);
         pos = next;
-        const signed = unzigzag(rawVal);
+        if (
+          typeof rawVal === "number" && typeof prev === "number" &&
+          typeof prevDelta === "number"
+        ) {
+          const signed = unzigzagNumber(rawVal);
+          let cur: number;
+          let delta: number = prevDelta;
+          if (desc.encoding === ENCODING_RAW || count === 0) {
+            cur = signed;
+          } else if (desc.encoding === ENCODING_DELTA_OF_DELTA) {
+            delta = count === 1 ? signed : delta + signed;
+            cur = prev + delta;
+          } else {
+            cur = prev + signed;
+          }
+          if (Number.isSafeInteger(cur) && Number.isSafeInteger(delta)) {
+            values[slot] = cur / factor;
+            prev = cur;
+            prevDelta = delta;
+            count++;
+            continue;
+          }
+        }
+
+        // 初值或累计 delta 越过安全整数后，整条序列保持 BigInt 运算；仅输出时转 Number。
+        const signed = typeof rawVal === "bigint"
+          ? (rawVal >> 1n) ^ -(rawVal & 1n)
+          : BigInt(unzigzagNumber(rawVal));
+        const previous = typeof prev === "bigint" ? prev : BigInt(prev);
+        prevDelta = typeof prevDelta === "bigint" ? prevDelta : BigInt(prevDelta);
         let cur: bigint;
         if (desc.encoding === ENCODING_RAW) {
           cur = signed;
@@ -301,15 +405,15 @@ export async function decodeBlock(raw: Uint8Array): Promise<DecodedBlock> {
           if (count === 0) {
             cur = signed;
           } else if (count === 1) {
-            cur = prev + signed;
+            cur = previous + signed;
             prevDelta = signed;
           } else {
-            const delta = prevDelta + signed;
-            cur = prev + delta;
+            const delta: bigint = prevDelta + signed;
+            cur = previous + delta;
             prevDelta = delta;
           }
         } else {
-          cur = count === 0 ? signed : prev + signed;
+          cur = count === 0 ? signed : previous + signed;
         }
         values[slot] = Number(cur) / factor;
         prev = cur;
@@ -330,6 +434,9 @@ export async function decodeBlock(raw: Uint8Array): Promise<DecodedBlock> {
     interval,
     bucketStart,
     slotCount,
+    actualPointCount: occupiedSlots
+      ? countOccupiedSlots(occupiedSlots, slotCount)
+      : seriesCount > 0 ? slotCount : 0,
     aggregateCount,
     dims,
     memoryTotal,

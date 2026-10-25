@@ -129,6 +129,12 @@ add("/api/v2/agents/register", "post", "registerAgentV2", {
   responses: { 200: ok(data(ref("AgentRegistrationResult"))), 201: ok(data(ref("AgentRegistrationResult"))), 400: problem, 401: problem, 503: problem },
 });
 add("/api/v2/agents/{id}/metrics", "get", "listAgentMetricsV2", { parameters: [pathId(), { name: "hours", in: "query", schema: { type: "string", enum: ["1", "6", "12", "24", "168"], default: "24" } }], responses: { 200: ok(data({ type: "array", items: ref("AgentMetric") })), 400: problem, 401: problem, 404: problem, 500: problem } });
+add("/api/v2/agents/{id}/metrics/blocks", "get", "getAgentMetricBlocksV2", {
+  parameters: [pathId(), { name: "hours", in: "query", schema: { type: "string", enum: ["1", "6", "12", "24", "168"], default: "24" } }],
+  responses: { 200: { description: "Private metric archives: XHR1 + uint32LE metadata byte length + JSON metadata + ordered raw block bytes.",
+    content: { "application/vnd.xugou.metrics+binary": { schema: { type: "string", format: "binary" } } } },
+    400: problem, 401: problem, 404: problem, 500: problem },
+});
 add("/api/v2/agents/{id}/metrics/latest", "get", "getLatestAgentMetricV2", { parameters: [pathId()], responses: { 200: ok(data({ oneOf: [ref("AgentMetric"), { type: "null" }] })), 400: problem, 401: problem, 404: problem, 500: problem } });
 add("/api/v2/agents/{id}/credentials", "get", "listAgentCredentialsV2", {
   parameters: [
@@ -143,10 +149,16 @@ add("/api/v2/agents/{id}/credentials/{credentialId}", "delete", "revokeAgentCred
 add("/api/v2/agents/{id}", "get", "getAgentV2", { parameters: [pathId()], responses: { 200: ok(data(ref("Agent"))), 400: problem, 401: problem, 404: problem, 500: problem } });
 add("/api/v2/agents/{id}", "patch", "updateAgentV2", { parameters: [pathId()], requestBody: { required: true, ...json(ref("AgentUpdate")) }, responses: { 200: ok(data(ref("Agent"))), 400: problem, 401: problem, 404: problem, 409: problem, 500: problem } });
 add("/api/v2/agents/{id}", "delete", "deleteAgentV2", { parameters: [pathId()], responses: { 204: noContent, 400: problem, 401: problem, 500: problem } });
-add("/api/v2/agents/reports", "post", "acceptAgentReportV4", {
+add("/api/v2/agents/reports", "post", "acceptAgentReport", {
   security: [{ agentBearer: [] }],
-  requestBody: { required: true, ...json(ref("AgentReportV4")) },
-  responses: { 202: ok(ref("AgentReportAccepted")), 400: problem, 401: problem, 409: problem, 503: problem },
+  requestBody: { required: true, content: {
+    "application/json": { schema: ref("AgentReportV5") },
+    "application/vnd.xugou.report+binary": { schema: {
+      type: "string", format: "binary",
+      description: "v6: XG06 + uint32LE metadata JSON byte length + UTF-8 metadata (AgentReportV6Metadata) + ordered compressed block bytes. No outer content encoding.",
+    } },
+  } },
+  responses: { 202: ok(ref("AgentReportAccepted")), 400: problem, 401: problem, 409: problem, 422: problem, 503: problem },
 });
 
 
@@ -163,6 +175,9 @@ add("/api/v2/status/config", "get", "getStatusConfigV2", { responses: { 200: ok(
 add("/api/v2/status/config", "put", "saveStatusConfigV2", { requestBody: { required: true, ...json(ref("StatusConfigCommand")) }, responses: { 200: ok(data(ref("StatusConfigView"))), 400: problem, 401: problem, 500: problem } });
 add("/api/v2/status/public", "get", "getPublicStatusV2", { security: [], responses: { 200: ok(ref("PublicStatus")), 304: noContent, 503: problem, 500: problem } });
 add("/api/v2/status/public/agents/{agentId}/metrics", "get", "getPublicAgentMetricsV2", { security: [], parameters: [pathId("agentId")], responses: { 200: ok(ref("PublicAgentMetricsResult")), 304: noContent, 400: problem, 404: problem, 500: problem } });
+add("/api/v2/status/public/agents/{agentId}/metrics/manifest", "get", "getPublicAgentMetricManifestV2", { security: [], parameters: [pathId("agentId")], responses: { 200: ok(ref("PublicMetricManifest")), 304: noContent, 400: problem, 404: problem, 500: problem } });
+add("/api/v2/status/public/agents/{agentId}/metrics/hours", "get", "getPublicAgentMetricHoursV2", { security: [], parameters: [pathId("agentId"), { name: "buckets", in: "query", required: true, schema: { type: "string", maxLength: 300 }, description: "1 to 25 comma-separated hour starts in epoch seconds." }], responses: { 200: ok(ref("PublicMetricHoursResult")), 400: problem, 404: problem, 500: problem } });
+add("/api/v2/status/public/agents/{agentId}/metrics/hours/{bucketStart}", "get", "getPublicAgentMetricHourV2", { security: [], parameters: [pathId("agentId"), { name: "bucketStart", in: "path", required: true, schema: { type: "integer", minimum: 0 } }], responses: { 200: ok(ref("PublicMetricHourResult")), 304: noContent, 400: problem, 404: problem, 500: problem } });
 
 add("/api/v2/notifications", "get", "getNotificationConfigV2", {
   responses: { 200: ok(data(ref("NotificationConfig"))), 401: problem, 500: problem },
@@ -480,12 +495,20 @@ const schemas: Record<string, Schema> = {
     required: ["collected_at"],
     properties: agentReportSampleProperties,
   },
-  AgentReportV4: {
+  AgentReportBlock: {
+    type: "object", additionalProperties: false,
+    required: ["resolution", "bucket_start", "point_count", "codec", "data"],
+    properties: {
+      resolution: { type: "integer", enum: [1, 60] }, bucket_start: { type: "integer", minimum: 0, maximum: 4_294_967_295 },
+      point_count: { type: "integer", minimum: 1, maximum: 60 }, codec: { const: 1 }, data: { type: "string", maxLength: 262_144 },
+    },
+  },
+  AgentReportV5: {
     type: "object",
     additionalProperties: false,
-    required: ["protocol_version", "report_id", "samples"],
+    required: ["protocol_version", "report_id", "blocks"],
     properties: {
-      protocol_version: { const: 4 },
+      protocol_version: { const: 5 },
       agent_version: { type: "string", minLength: 1, maxLength: 128 },
       report_id: { type: "string", format: "uuid" },
       hostname: { type: ["string", "null"], maxLength: 255 },
@@ -499,12 +522,42 @@ const schemas: Record<string, Schema> = {
       boot_time: { type: ["integer", "null"], minimum: 0 },
       keepalive_seconds: { type: "integer", minimum: 1, maximum: 86400 },
       report_interval_seconds: { type: "integer", minimum: 10, maximum: 3600 },
-      samples: {
+      blocks: {
         type: "array",
         minItems: 1,
-        maxItems: 100,
-        items: ref("AgentReportSample"),
+        maxItems: 120,
+        items: ref("AgentReportBlock"),
       },
+      latest: ref("AgentReportSample"),
+    },
+  },
+  PublicMinutePoint: {
+    type: "object", additionalProperties: false,
+    required: ["c", "m", "l", "s", "p", "t", "u", "v4", "v6", "d", "n"],
+    properties: {
+      c: { type: ["number", "null"] }, p: { type: ["number", "null"] }, t: { type: ["number", "null"] }, u: { type: ["number", "null"] },
+      v4: { type: ["number", "null"] }, v6: { type: ["number", "null"] },
+      m: { type: "array", items: { type: ["number", "null"] }, minItems: 4, maxItems: 4 },
+      l: { type: "array", items: { type: ["number", "null"] }, minItems: 3, maxItems: 3 },
+      s: { type: "array", items: { type: ["number", "null"] }, minItems: 2, maxItems: 2 },
+      d: { type: "array", maxItems: 128, items: { type: "array", items: { type: ["string", "number", "null"] }, minItems: 5, maxItems: 5 } },
+      n: { type: "array", maxItems: 128, items: { type: "array", items: { type: ["string", "number", "null"] }, minItems: 5, maxItems: 5 } },
+    },
+  },
+  PublicMetricManifest: {
+    type: "object", required: ["success", "agent_id", "from", "to", "hours"],
+    properties: {
+      success: { const: true }, agent_id: { type: "integer" }, from: { type: "integer" }, to: { type: "integer" },
+      hours: { type: "array", maxItems: 25, items: { type: "object", required: ["bucket_start", "revision"], properties: { bucket_start: { type: "integer" }, revision: { type: "string" } } } },
+    },
+  },
+  PublicMetricHourResult: {
+    type: "object", required: ["success", "agent_id", "bucket_start", "chunk"],
+    properties: {
+      success: { const: true }, agent_id: { type: "integer" }, bucket_start: { type: "integer" },
+      chunk: { type: "object", required: ["v", "r", "p"], properties: {
+        v: { const: 1 }, r: { type: "integer" }, p: { type: "object", additionalProperties: ref("PublicMinutePoint") },
+      } },
     },
   },
   AgentReportAccepted: { type: "object", required: ["report_id", "accepted", "duplicate", "config"], properties: { report_id: { type: "string", format: "uuid" }, accepted: { type: "boolean" }, duplicate: { type: "boolean" }, config: { type: "object", required: ["collect_interval_seconds", "report_interval_seconds", "update"], properties: { collect_interval_seconds: { type: "integer" }, report_interval_seconds: { type: "integer" }, update: { type: "boolean" } } } } },
@@ -531,6 +584,65 @@ const schemas: Record<string, Schema> = {
   NotificationConfig: { type: "object", required: ["channels", "templates", "channels_has_more", "templates_has_more", "settings"], properties: { channels: { type: "array", maxItems: 100, items: ref("NotificationChannel") }, templates: { type: "array", maxItems: 100, items: ref("NotificationTemplate") }, channels_has_more: { type: "boolean" }, templates_has_more: { type: "boolean" }, settings: { type: "object", required: ["monitors", "agents", "specificMonitors", "specificAgents"], properties: { monitors: ref("NotificationMonitorSetting"), agents: ref("NotificationAgentSetting"), specificMonitors: { type: "object", additionalProperties: ref("NotificationMonitorSetting") }, specificAgents: { type: "object", additionalProperties: ref("NotificationAgentSetting") } } } } },
   NotificationHistory: { type: "object", required: ["id", "type", "channel_id", "template_id", "status", "content"], properties: { id: { type: "integer" }, type: { type: "string" }, target_id: { type: ["integer", "null"] }, channel_id: { type: "integer" }, template_id: { type: "integer" }, status: { type: "string" }, content: { type: "string" }, error: { type: ["string", "null"] }, sent_at: { type: ["string", "null"] } } },
   NotificationHistoryPage: { type: "object", required: ["data", "next_cursor", "has_more"], properties: { data: { type: "array", items: ref("NotificationHistory") }, next_cursor: { type: ["integer", "null"] }, has_more: { type: "boolean" } } },
+};
+
+schemas.PublicMetricHourChunk = (schemas.PublicMetricHourResult.properties as Record<string, Schema>).chunk;
+schemas.PublicMetricHoursResult = {
+  type: "object", required: ["success", "agent_id", "hours", "missing"],
+  properties: { success: { const: true }, agent_id: { type: "integer" },
+    hours: { type: "array", maxItems: 25, items: { type: "object", required: ["bucket_start", "chunk"],
+      properties: { bucket_start: { type: "integer" }, chunk: ref("PublicMetricHourChunk") } } },
+    missing: { type: "array", maxItems: 25, items: { type: "integer" } },
+  },
+};
+
+const nonnegativeMetric = { type: "number", minimum: 0, maximum: Number.MAX_SAFE_INTEGER };
+const summaryTimestamp = { type: "integer", minimum: 0, maximum: 4_294_967_295_999 };
+schemas.AgentTrafficInterfaceSummary = {
+  type: "object", additionalProperties: false,
+  required: ["name", "first_ts", "last_ts", "first_rx", "first_tx", "last_rx", "last_tx", "delta_rx", "delta_tx"],
+  properties: { name: { type: "string", minLength: 1, maxLength: 512 }, first_ts: summaryTimestamp, last_ts: summaryTimestamp,
+    first_rx: nonnegativeMetric, first_tx: nonnegativeMetric, last_rx: nonnegativeMetric, last_tx: nonnegativeMetric,
+    delta_rx: nonnegativeMetric, delta_tx: nonnegativeMetric },
+};
+schemas.AgentReportSummary = {
+  type: "object", additionalProperties: false,
+  required: ["first_ts", "last_ts", "cpu_usage_peak", "memory_usage_peak", "disk_usage_peak", "traffic"],
+  properties: { first_ts: summaryTimestamp, last_ts: summaryTimestamp,
+    cpu_usage_peak: { type: ["number", "null"], minimum: 0, maximum: 100 },
+    memory_usage_peak: { type: ["number", "null"], minimum: 0, maximum: 100 },
+    disk_usage_peak: { type: ["number", "null"], minimum: 0, maximum: 100 },
+    traffic: { type: "array", minItems: 1, maxItems: 120, items: {
+      type: "object", additionalProperties: false,
+      required: ["utc_day", "first_ts", "last_ts", "interfaces", "last_speed"],
+      properties: { utc_day: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" }, first_ts: summaryTimestamp, last_ts: summaryTimestamp,
+        interfaces: { type: "array", maxItems: 128, items: ref("AgentTrafficInterfaceSummary") },
+        last_speed: { oneOf: [{ type: "null" }, { type: "object", additionalProperties: false, required: ["rx", "tx"],
+          properties: { rx: { type: ["number", "null"], minimum: 0 }, tx: { type: ["number", "null"], minimum: 0 } } }] },
+      },
+    } },
+  },
+};
+const { data: _binaryData, ...binaryBlockProperties } = schemas.AgentReportBlock.properties as Record<string, Schema>;
+void _binaryData;
+schemas.AgentReportV6Metadata = {
+  ...schemas.AgentReportV5,
+  required: ["protocol_version", "report_id", "blocks", "latest", "minute_summaries", "summary"],
+  properties: {
+    ...schemas.AgentReportV5.properties as Record<string, Schema>,
+    protocol_version: { const: 6 },
+    blocks: { type: "array", minItems: 1, maxItems: 120, items: {
+      type: "object", additionalProperties: false,
+      required: ["resolution", "bucket_start", "point_count", "codec", "byte_length"],
+      properties: { ...binaryBlockProperties, byte_length: { type: "integer", minimum: 32, maximum: 196_608 } },
+    } },
+    summary: ref("AgentReportSummary"),
+    minute_summaries: { type: "array", minItems: 1, maxItems: 120, items: {
+      type: "object", additionalProperties: false, required: ["bucket_start", "point_count", "avg"],
+      properties: { bucket_start: { type: "integer", minimum: 0, maximum: 4_294_967_295 },
+        point_count: { type: "integer", minimum: 1, maximum: 60 }, avg: ref("AgentReportSample") },
+    } },
+  },
 };
 
 const spec = {

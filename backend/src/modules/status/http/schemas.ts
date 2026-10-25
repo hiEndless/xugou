@@ -39,3 +39,12 @@ export const publicAgentIdSchema = z.coerce
   .int()
   .positive()
   .max(Number.MAX_SAFE_INTEGER);
+
+export const publicMetricHourSchema = z.coerce.number().int().nonnegative()
+  .max(Number.MAX_SAFE_INTEGER)
+  .refine((value) => value % 3600 === 0, "Metric hour must start on an hour boundary");
+
+export const publicMetricBucketsSchema = z.string().min(1).max(300)
+  .transform((value) => value.split(","))
+  .pipe(z.array(z.string().regex(/^\d+$/).pipe(publicMetricHourSchema)).min(1).max(25))
+  .transform((buckets) => [...new Set(buckets)]);

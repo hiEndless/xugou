@@ -3,17 +3,14 @@ import { writeStructuredLog } from "../../../platform/observability/StructuredLo
 import { QueueJobPublisher } from "../../../platform/queues/QueuePublisher";
 import type { StatusRepositoryPort } from "../application/StatusUseCases";
 import type { StatusPageConfigCommand } from "../domain/models";
-import type { BlockSample } from "../../agents/metricblock/materialize";
-import {
-  downsample,
-  queryAgentSamplesBatch,
-} from "../../agents/metricblock/query";
+import { downsample } from "../../agents/metricblock/query";
+import type { PublicMetricHour } from "../../agents/metricblock/public-projection";
+import { D1PublicMetricHistory, expandPublicMinute } from "./D1PublicMetricHistory";
 
 import {
   projectPublicDiskMetrics,
   projectPublicNetworkMetrics,
   toPublicAgent,
-  type PublicAgentMetric,
   type PublicAgentSource,
 } from "../domain/public-contract";
 
@@ -82,58 +79,6 @@ function toLatestMetric(row: MetricRow | undefined, onInvalid: InvalidMetricHand
     network_tx_speed: row.network_tx_speed,
     month_rx: row.month_rx,
     month_tx: row.month_tx,
-  };
-}
-
-/**
- * 把还原出的块样本投影成状态页的公开指标。
- *
- * 相比 v4 从 metrics_json 里解析任意 JSON，块格式只承载类型化数值与
- * 挂载点/网卡名，没有自由字段可以夹带秘密 —— 原先针对
- * PUBLIC_METRIC_SENSITIVE_KEY 的扫描在这条路径上不再需要。
- */
-function blockSampleToPublicMetric(
-  agentId: number,
-  sample: BlockSample
-): PublicAgentMetric {
-  return {
-    id: `${agentId}:${sample.timestampMs}`,
-    agent_id: agentId,
-    timestamp: new Date(sample.timestampMs).toISOString(),
-    cpu_usage: sample.cpuUsage,
-    memory_total: sample.memoryTotal,
-    memory_used: sample.memoryUsed,
-    memory_free: sample.memoryFree,
-    memory_usage_rate: sample.memoryUsageRate,
-    load_1: sample.load1,
-    load_5: sample.load5,
-    load_15: sample.load15,
-    disk_metrics: sample.disks.map((disk) => ({
-      // device/fs_type 是静态元数据，不入块；公开页也不需要
-      device: disk.mountPoint,
-      mount_point: disk.mountPoint,
-      total: disk.total,
-      used: disk.used ?? 0,
-      free: disk.free ?? 0,
-      usage_rate: disk.usageRate ?? 0,
-      fs_type: "",
-    })),
-    network_metrics: sample.nets.map((net) => ({
-      interface: net.iface,
-      bytes_sent: net.bytesSent ?? 0,
-      bytes_recv: net.bytesRecv ?? 0,
-      packets_sent: net.packetsSent ?? 0,
-      packets_recv: net.packetsRecv ?? 0,
-    })),
-    swap_total: sample.swapTotal,
-    swap_used: sample.swapUsed,
-    process_count: sample.processCount,
-    tcp_connections: sample.tcpConnections,
-    udp_connections: sample.udpConnections,
-    ipv4_reachable:
-      sample.ipv4Reachable === null ? null : sample.ipv4Reachable ? 1 : 0,
-    ipv6_reachable:
-      sample.ipv6Reachable === null ? null : sample.ipv6Reachable ? 1 : 0,
   };
 }
 
@@ -338,28 +283,41 @@ export class D1StatusRepository implements StatusRepositoryPort {
   }
 
   async getActiveMetricPublication(agentId: number) {
-    const row = await this.env.DB.prepare(
-      `SELECT metric.agent_id, metric.payload_json, metric.etag, metric.generated_at
-       FROM status_publication_state state
-       JOIN status_metric_publications metric
-         ON metric.status_publication_id = state.active_publication_id
-       WHERE state.singleton_key = 1 AND metric.agent_id = ? LIMIT 1`
-    )
-      .bind(agentId)
-      .first<{
-        agent_id: number;
-        payload_json: string;
-        etag: string;
-        generated_at: string;
-      }>();
-    return row
-      ? {
-          agentId: row.agent_id,
-          payloadJson: row.payload_json,
-          etag: row.etag,
-          generatedAt: row.generated_at,
-        }
-      : null;
+    const history = new D1PublicMetricHistory(this.env);
+    const manifest = await history.manifest(agentId);
+    if (!manifest) return null;
+    // Compatibility for older clients only. The current frontend fetches and
+    // caches individual hours and expands their compact points in a Web Worker.
+    const metrics = [];
+    for (const item of manifest.hours) {
+      const hour = await history.hour(agentId, item.bucket_start);
+      if (!hour) continue;
+      const { chunk } = JSON.parse(hour.payloadJson) as { chunk: PublicMetricHour };
+      for (const [slot, point] of Object.entries(chunk.p)) {
+        const timestamp = (item.bucket_start + Number(slot) * 60) * 1000;
+        if (timestamp < manifest.from * 1000 || timestamp > manifest.to * 1000) continue;
+        metrics.push(expandPublicMinute(agentId, timestamp, point));
+      }
+    }
+    metrics.sort((left, right) => Date.parse(left.timestamp) - Date.parse(right.timestamp));
+    return {
+      agentId,
+      payloadJson: JSON.stringify({ success: true, agent: downsample(metrics, MAX_PUBLIC_METRIC_POINTS) }),
+      etag: `"public-metrics-${agentId}-${Math.floor(manifest.from / 60)}-${manifest.hours.map((hour) => hour.revision).join("-")}"`,
+      generatedAt: new Date(manifest.to * 1000).toISOString(),
+    };
+  }
+
+  getPublicMetricManifest(agentId: number) {
+    return new D1PublicMetricHistory(this.env).manifest(agentId);
+  }
+
+  getPublicMetricHour(agentId: number, bucketStart: number) {
+    return new D1PublicMetricHistory(this.env).hour(agentId, bucketStart);
+  }
+
+  getPublicMetricHours(agentId: number, buckets: number[]) {
+    return new D1PublicMetricHistory(this.env).hours(agentId, buckets);
   }
 
   async buildPublicData() {
@@ -446,8 +404,13 @@ export class D1StatusRepository implements StatusRepositoryPort {
                       response_time_ms AS response_time, status_code, error
                FROM monitor_check_samples
                WHERE monitor_id IN (${selectedMonitorSql}) AND checked_at >= ?
+                 AND NOT EXISTS (
+                   SELECT 1 FROM monitor_check_rollups rollup
+                   WHERE rollup.monitor_id = monitor_check_samples.monitor_id
+                     AND rollup.bucket_size_seconds = 300 AND rollup.bucket_start >= ?
+                 )
                ORDER BY checked_at ASC LIMIT 10000`
-        ).bind(config.id, since).all<Record<string, unknown>>(),
+        ).bind(config.id, since, since).all<Record<string, unknown>>(),
         this.env.DB.prepare(publicAgentQuery)
           .bind(config.id)
           .all<PublicAgentSource>(),
@@ -473,7 +436,9 @@ export class D1StatusRepository implements StatusRepositoryPort {
     const daily = new Map<number, Record<string, unknown>[]>();
     for (const row of dailyResult.results) {
       const id = Number(row.monitor_id);
-      daily.set(id, [...(daily.get(id) ?? []), row]);
+      const rows = daily.get(id) ?? [];
+      rows.push(row);
+      daily.set(id, rows);
     }
     const rollups = new Map<number, Record<string, unknown>[]>();
     for (const row of rollupResult.results) {
@@ -487,12 +452,16 @@ export class D1StatusRepository implements StatusRepositoryPort {
         status_code: null,
         error: null,
       };
-      rollups.set(id, [...(rollups.get(id) ?? []), mapped]);
+      const rows = rollups.get(id) ?? [];
+      rows.push(mapped);
+      rollups.set(id, rows);
     }
     const rawHistory = new Map<number, Record<string, unknown>[]>();
     for (const row of historyResult.results) {
       const id = Number(row.monitor_id);
-      rawHistory.set(id, [...(rawHistory.get(id) ?? []), row]);
+      const rows = rawHistory.get(id) ?? [];
+      rows.push(row);
+      rawHistory.set(id, rows);
     }
     const latestByAgent = new Map(
       metricResult.results.map((row) => [
@@ -530,35 +499,4 @@ export class D1StatusRepository implements StatusRepositoryPort {
     };
   }
 
-  /**
-   * 状态页的 24 小时指标曲线。
-   *
-   * 窗口固定 24 小时，远超 1 秒层的适用范围，因此直读 1 分钟聚合层（avg），
-   * 再等距降采样到 MAX_PUBLIC_METRIC_POINTS。
-   *
-   * v4 时代这里要先查 rollup、查不到再回落到原始样本 —— 而 rollup 的写入方
-   * 从未被调用，那张表恒为 0 行，于是永远走 fallback。现在只有一条路径。
-   */
-  async buildPublicAgentMetricPublications(agentIds: number[]) {
-    const selected = uniquePositiveIds(agentIds).slice(0, MAX_PUBLIC_COMPONENTS_PER_TYPE);
-    if (selected.length === 0) return [];
-
-    const toSec = Math.floor(Date.now() / 1000);
-    const fromSec = toSec - 24 * 60 * 60;
-    const byAgent = await queryAgentSamplesBatch(
-      this.env,
-      selected,
-      fromSec,
-      toSec,
-      { resolution: 60 }
-    );
-
-    return selected.map((agentId) => ({
-      agentId,
-      metrics: downsample(
-        byAgent.get(agentId) ?? [],
-        MAX_PUBLIC_METRIC_POINTS
-      ).map((sample) => blockSampleToPublicMetric(agentId, sample)),
-    }));
-  }
 }

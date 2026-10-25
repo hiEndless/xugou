@@ -3,6 +3,7 @@ import type {
   ActiveStatusPublication,
   ActiveMetricPublication,
   StatusPageConfigCommand,
+  PublicMetricManifest,
 } from "../domain/models";
 
 export interface StatusRepositoryPort {
@@ -10,6 +11,9 @@ export interface StatusRepositoryPort {
   saveConfig(input: StatusPageConfigCommand): Promise<unknown>;
   getActivePublication(): Promise<ActiveStatusPublication | null>;
   getActiveMetricPublication(agentId: number): Promise<ActiveMetricPublication | null>;
+  getPublicMetricManifest(agentId: number): Promise<PublicMetricManifest | null>;
+  getPublicMetricHour(agentId: number, bucketStart: number): Promise<{ payloadJson: string; etag: string } | null>;
+  getPublicMetricHours(agentId: number, buckets: number[]): Promise<{ payloadJson: string } | null>;
 }
 
 export class StatusUseCases {
@@ -62,5 +66,23 @@ export class StatusUseCases {
       "PUBLIC_AGENT_NOT_FOUND",
       "Public agent metric publication not found"
     );
+  }
+
+  async getPublicMetricManifest(agentId: number) {
+    const manifest = await this.repository.getPublicMetricManifest(agentId);
+    if (manifest) return manifest;
+    throw new ApplicationProblem(404, "PUBLIC_AGENT_NOT_FOUND", "Public agent not found");
+  }
+
+  async getPublicMetricHour(agentId: number, bucketStart: number) {
+    const hour = await this.repository.getPublicMetricHour(agentId, bucketStart);
+    if (hour) return hour;
+    throw new ApplicationProblem(404, "PUBLIC_METRIC_HOUR_NOT_FOUND", "Public metric hour not found");
+  }
+
+  async getPublicMetricHours(agentId: number, buckets: number[]) {
+    const hours = await this.repository.getPublicMetricHours(agentId, buckets);
+    if (hours) return hours;
+    throw new ApplicationProblem(404, "PUBLIC_AGENT_NOT_FOUND", "Public agent not found");
   }
 }

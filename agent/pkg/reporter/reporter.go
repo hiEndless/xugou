@@ -85,11 +85,12 @@ func NewHTTPReporter() *model.HTTPReporter {
 	return reporter
 }
 
-// Report 使用 gzip 发送 v5 批次。调用方只在 2xx 后 Ack Spool，因此 HTTP 超时、
+// Report 对新批次直接发送 v6 二进制；升级前已持久化的 v5 仍使用 JSON gzip。
+// 调用方只在 2xx 后 Ack Spool，因此 HTTP 超时、
 // 5xx 或进程退出都会在下一轮重用同一个 report_id 和 Payload。
 func (r *DefaultReporter) Report(ctx context.Context, report *model.AgentReport) (*config.RemoteConfig, error) {
 	if report == nil || report.ReportID == "" || len(report.Blocks) == 0 {
-		return nil, errors.New("没有可上报的 v5 批次")
+		return nil, errors.New("没有可上报的批次")
 	}
 
 	if !r.reporter.Registered {
@@ -100,24 +101,12 @@ func (r *DefaultReporter) Report(ctx context.Context, report *model.AgentReport)
 	}
 
 	reportURL := fmt.Sprintf("%s/api/v2/agents/reports", r.reporter.ServerURL)
-	reportPayload, err := json.Marshal(report)
+	payload, contentType, contentEncoding, err := encodeReport(report)
 	if err != nil {
-		log.Println("序列化上报数据失败: ", err)
 		return nil, err
 	}
-	var compressed bytes.Buffer
-	zipper, err := gzip.NewWriterLevel(&compressed, gzip.BestSpeed)
-	if err != nil {
-		return nil, fmt.Errorf("创建 gzip 编码器失败: %w", err)
-	}
-	if _, err := zipper.Write(reportPayload); err != nil {
-		return nil, fmt.Errorf("压缩上报数据失败: %w", err)
-	}
-	if err := zipper.Close(); err != nil {
-		return nil, fmt.Errorf("结束压缩上报数据失败: %w", err)
-	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", reportURL, bytes.NewReader(compressed.Bytes()))
+	req, err := http.NewRequestWithContext(ctx, "POST", reportURL, bytes.NewReader(payload))
 	if err != nil {
 		log.Println("创建请求失败：", err)
 		return nil, err
@@ -125,7 +114,10 @@ func (r *DefaultReporter) Report(ctx context.Context, report *model.AgentReport)
 	setDefaultHeaders(req)
 	setAgentVersionHeader(req)
 	req.Header.Set("Authorization", "Bearer "+r.reporter.ApiToken)
-	req.Header.Set("Content-Encoding", "gzip")
+	req.Header.Set("Content-Type", contentType)
+	if contentEncoding != "" {
+		req.Header.Set("Content-Encoding", contentEncoding)
+	}
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := r.reporter.Client.Do(req)
@@ -141,9 +133,35 @@ func (r *DefaultReporter) Report(ctx context.Context, report *model.AgentReport)
 		log.Println(err)
 		return nil, err
 	}
-	log.Printf("v5 批量上报成功: report_id=%s blocks=%d samples=%d compressed_bytes=%d",
-		report.ReportID, len(report.Blocks), report.SampleCount(), compressed.Len())
+	log.Printf("v%d 批量上报成功: report_id=%s blocks=%d samples=%d wire_bytes=%d",
+		report.ProtocolVersion, report.ReportID, len(report.Blocks), report.SampleCount(), len(payload))
 	return parseV4ConfigResponse(resp), nil
+}
+
+func encodeReport(report *model.AgentReport) ([]byte, string, string, error) {
+	if report.ProtocolVersion == model.AgentReportProtocolVersion {
+		payload, err := model.EncodeBinaryReport(report)
+		return payload, model.AgentReportBinaryContentType, "", err
+	}
+	if report.ProtocolVersion != 5 {
+		return nil, "", "", fmt.Errorf("不支持的上报协议版本 %d", report.ProtocolVersion)
+	}
+	encoded, err := json.Marshal(report)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("序列化旧版上报数据失败: %w", err)
+	}
+	var compressed bytes.Buffer
+	zipper, err := gzip.NewWriterLevel(&compressed, gzip.BestSpeed)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("创建 gzip 编码器失败: %w", err)
+	}
+	if _, err := zipper.Write(encoded); err != nil {
+		return nil, "", "", fmt.Errorf("压缩旧版上报数据失败: %w", err)
+	}
+	if err := zipper.Close(); err != nil {
+		return nil, "", "", fmt.Errorf("结束旧版上报压缩失败: %w", err)
+	}
+	return compressed.Bytes(), "application/json", "gzip", nil
 }
 
 type v4ReportResponse struct {

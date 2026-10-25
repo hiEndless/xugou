@@ -18,3 +18,10 @@ export interface ActiveMetricPublication extends ActiveStatusPublication {
   agentId: number;
 }
 
+export interface PublicMetricManifest {
+  success: true;
+  agent_id: number;
+  from: number;
+  to: number;
+  hours: { bucket_start: number; revision: string }[];
+}
