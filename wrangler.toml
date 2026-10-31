@@ -33,6 +33,7 @@ FREE_MODE = "true"
 # 前端默认与 API 同源。确需独立管理域名时使用逗号分隔的完整 Origin；
 # 凭据化 CORS 忽略 `*`，避免把 HttpOnly 管理会话暴露给任意站点。
 # ALLOWED_ORIGINS = "https://console.example.com"
+ADMIN_INITIAL_PASSWORD = "admin123"
 SESSION_HMAC_SECRET = "c33121d3eef0c315b9932d922a2d81c4cca0bb79a8528cf9227daf4ff8013d08"
 AGENT_ENROLLMENT_TTL_MINUTES = "30"
 NOTIFICATION_KEK_VERSION = "1"
