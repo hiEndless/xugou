@@ -69,7 +69,7 @@ LATEST_AGENT_VERSION = "v1.6.0"
 [[d1_databases]]
 binding = "DB"
 database_name = "xugou_db" # 使用占位符
-database_id = "5e00e49a-5051-4234-ab74-78bf9823f2eb" # 使用占位符
+database_id = "67a7e370-5e6c-4e53-9df1-ba3dbc7bb60b" # 使用占位符
 migrations_table = "migrations"
 migrations_dir = "backend/drizzle"
 
